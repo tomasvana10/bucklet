@@ -102,6 +102,20 @@ def _app(tmp_path: Path, fake: FakeService, *, allow_deletion: bool = False):
     )
 
 
+def _messages(app):
+    """(text, severity) pairs currently shown in the message stack."""
+    from bucklet.tui.app import MessageStack
+
+    return app.query_one(MessageStack).messages
+
+
+def _has_message(app, substring: str, severity: str | None = None) -> bool:
+    return any(
+        substring in text and (severity is None or sev == severity)
+        for text, sev in _messages(app)
+    )
+
+
 async def test_table_populates(tmp_path):
     app = _app(tmp_path, FakeService())
     async with app.run_test() as pilot:
@@ -199,16 +213,12 @@ async def test_ctrl_c_quits(tmp_path):
 
 
 async def test_initial_error_is_shown(tmp_path):
-    from textual.widgets import Static
-
     app = BuckletApp(
         config=Config(tmp_path / "config.json"), service=None, error="cannot open 'b': denied"
     )
     async with app.run_test() as pilot:
         await pilot.pause()
-        message = app.query_one("#message", Static)
-        assert "denied" in str(message.render())
-        assert message.has_class("error")
+        assert _has_message(app, "denied", "error")
 
 
 async def test_initial_profile_opens_in_background(tmp_path, monkeypatch):
@@ -290,8 +300,6 @@ async def test_delete_does_nothing_without_flag(tmp_path):
 
 
 async def test_delete_confirmed_removes_object(tmp_path):
-    from textual.widgets import Static
-
     fake = FakeService()
     app = _app(tmp_path, fake, allow_deletion=True)
     async with app.run_test() as pilot:
@@ -307,7 +315,7 @@ async def test_delete_confirmed_removes_object(tmp_path):
         assert "cold.bin" not in [o.key for o in app.objects]
         assert app.query_one(DataTable).row_count == 1
         # the user is told it worked
-        assert "deleted" in str(app.query_one("#message", Static).render())
+        assert _has_message(app, "deleted")
 
 
 async def test_delete_then_reload_does_not_resurrect(tmp_path):
@@ -380,8 +388,6 @@ async def test_delete_while_filtered_removes_from_view(tmp_path):
 
 
 async def test_failed_delete_keeps_object_and_warns(tmp_path):
-    from textual.widgets import Static
-
     fake = FakeService()
     fake.delete_error = "access denied (check the IAM policy and keys)"
     app = _app(tmp_path, fake, allow_deletion=True)
@@ -396,17 +402,13 @@ async def test_failed_delete_keeps_object_and_warns(tmp_path):
         # the object must stay put when S3 refuses the delete
         assert "cold.bin" in [o.key for o in app.objects]
         assert app.query_one(DataTable).row_count == 2
-        message = app.query_one("#message", Static)
-        assert "access denied" in str(message.render())
-        assert message.has_class("error")
+        assert _has_message(app, "access denied", "error")
 
 
 # --- graceful degradation when the bucket can't be listed -------------------
 
 
 async def test_list_failure_shows_empty_table(tmp_path):
-    from textual.widgets import Static
-
     fake = FakeService()
     fake.list_error = "access denied (check the IAM policy and keys)"
     app = _app(tmp_path, fake)
@@ -416,9 +418,7 @@ async def test_list_failure_shows_empty_table(tmp_path):
         # no crash; empty table and a surfaced error
         assert app.query_one(DataTable).row_count == 0
         assert app.objects == []
-        message = app.query_one("#message", Static)
-        assert "access denied" in str(message.render())
-        assert message.has_class("error")
+        assert _has_message(app, "access denied", "error")
 
 
 async def test_actions_safe_on_empty_listing(tmp_path):
@@ -493,6 +493,200 @@ async def test_filter_does_not_toast(tmp_path):
         await pilot.pause()
         assert app.state_filter == storage.COLD  # still cycles
         assert calls == []  # but no toast
+
+
+# --- errors go to the message line, not a toast -----------------------------
+
+
+async def test_errors_show_in_message_not_toast(tmp_path):
+    fake = FakeService()
+    fake.delete_error = "access denied"
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        calls = []
+        app.notify = lambda *a, **k: calls.append((a, k))  # type: ignore[method-assign]
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")  # confirm; delete fails
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert _has_message(app, "access denied", "error")
+        assert calls == []  # surfaced once, in the message stack — no toast
+
+
+# --- the message stack itself (stacking, keys, severity, trim, expiry) ------
+
+
+def _item(app, text):
+    from bucklet.tui.app import MessageStack
+
+    return next(i for i in app.query_one(MessageStack)._items if i.message_text == text)
+
+
+async def test_messages_stack(tmp_path):
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("first", timeout=30.0)
+        app.flash("second", severity="warning", timeout=30.0)
+        await pilot.pause()
+        texts = [t for t, _ in _messages(app)]
+        assert "first" in texts and "second" in texts  # both visible, stacked
+        assert dict(_messages(app))["second"] == "warning"  # severity carried
+        # severity drives the actual colour class, not just stored state
+        assert _item(app, "second").has_class("-warning")
+        assert _item(app, "first").has_class("-info")
+
+
+async def test_keyed_message_updates_in_place(tmp_path):
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("uploading 1/3", key="op", timeout=30.0)
+        app.flash("uploading 2/3", key="op", timeout=30.0)
+        await pilot.pause()
+        texts = [t for t, _ in _messages(app)]
+        # one keyed line, updated — not two stacked
+        assert "uploading 1/3" not in texts
+        assert texts.count("uploading 2/3") == 1
+
+
+async def test_message_stack_trims_to_max(tmp_path):
+    from bucklet.tui.app import MessageStack
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        for i in range(MessageStack.MAX + 3):
+            app.flash(f"msg {i}", timeout=30.0)
+        await pilot.pause()
+        texts = [t for t, _ in _messages(app)]
+        assert len(texts) <= MessageStack.MAX
+        assert "msg 0" not in texts  # oldest trimmed
+        assert f"msg {MessageStack.MAX + 2}" in texts  # newest kept
+
+
+async def test_messages_expire(tmp_path):
+    import asyncio
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("blip", timeout=0.05)
+        await pilot.pause()
+        assert _has_message(app, "blip")
+        await asyncio.sleep(0.15)  # let the expiry timer fire
+        await pilot.pause()
+        assert not _has_message(app, "blip")
+
+
+async def test_empty_text_clears_keyed_message(tmp_path):
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("working…", key="op", timeout=30.0)
+        await pilot.pause()
+        assert _has_message(app, "working…")
+        app.flash("", key="op")  # empty text clears the keyed line
+        await pilot.pause()
+        assert not _has_message(app, "working…")
+
+
+async def test_keyed_update_restarts_expiry_timer(tmp_path):
+    """A keyed line being updated must not expire on its original timer —
+    otherwise a long progress stream would vanish mid-transfer."""
+    import asyncio
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("progress 10%", key="op", timeout=0.3)
+        await asyncio.sleep(0.2)  # most of the original timeout elapses
+        app.flash("progress 90%", key="op", timeout=0.3)  # update restarts it
+        await asyncio.sleep(0.2)  # past the ORIGINAL deadline, within the new one
+        await pilot.pause()
+        assert _has_message(app, "progress 90%")  # still here -> timer restarted
+
+
+async def test_keyed_severity_change(tmp_path):
+    """A keyed line can flip information -> error (progress that then fails)."""
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("uploading…", key="op", timeout=30.0)
+        await pilot.pause()
+        assert _item(app, "uploading…").has_class("-info")
+        app.flash("upload failed", severity="error", key="op", timeout=30.0)
+        await pilot.pause()
+        item = _item(app, "upload failed")
+        assert item.has_class("-error") and not item.has_class("-info")
+
+
+async def test_loading_cleared_on_success(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # the transient "loading…" status is gone once the listing succeeds
+        assert not _has_message(app, "loading")
+
+
+async def test_error_replaces_loading_in_place(tmp_path):
+    fake = FakeService()
+    fake.list_error = "access denied"
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # the error took over the "loading…" line (same key) rather than stacking
+        assert not _has_message(app, "loading")
+        assert _has_message(app, "access denied", "error")
+        assert len(_messages(app)) == 1
+
+
+# --- header / bar don't duplicate the bucket --------------------------------
+
+
+async def test_header_and_bar_do_not_duplicate(tmp_path):
+    from textual.widgets import Static
+
+    fake = FakeService()  # profile 't', bucket 'b', region 'us-east-1'
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # header carries profile + region
+        assert app.title == "bucklet · profile 't' · region us-east-1"
+        assert app.sub_title == ""
+        # bar carries the bucket, without the region-in-brackets
+        bar = str(app.query_one("#bar", Static).render())
+        assert "us-east-1" not in bar
+        assert "[" not in bar
+
+
+# --- dialogs scroll when they overflow --------------------------------------
+
+
+async def test_upload_dialog_is_scrollable(tmp_path):
+    from textual.containers import VerticalScroll
+
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("u")
+        await pilot.pause()
+        assert isinstance(app.screen.query_one("#dialog"), VerticalScroll)
 
 
 # --- per-profile settings ---------------------------------------------------
@@ -573,8 +767,6 @@ async def test_upload_uses_upload_many(tmp_path):
 
 
 async def test_upload_reports_partial_failure(tmp_path):
-    from textual.widgets import Static
-
     fake = FakeService()
     fake.plan = [(Path("a"), "a"), (Path("b"), "b")]
     fake.upload_errors = {"b": BuckletError("denied")}
@@ -585,5 +777,4 @@ async def test_upload_reports_partial_failure(tmp_path):
         await app.workers.wait_for_complete()
         await pilot.pause()
         assert fake.uploaded == ["a"]  # the good one still uploaded
-        message = app.query_one("#message", Static)
-        assert "failed" in str(message.render())
+        assert _has_message(app, "failed", "error")

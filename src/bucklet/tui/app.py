@@ -10,12 +10,17 @@ Thaw is offered only when the selected object's live state actually needs it.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Vertical
 from textual.widgets import DataTable, Footer, Header, Static
 from textual.worker import get_current_worker
+
+if TYPE_CHECKING:
+    from textual.timer import Timer
 
 from .. import storage
 from ..config import Config
@@ -70,13 +75,111 @@ class BuckletFooter(Footer):
         yield from widgets
 
 
+# severity -> the CSS class that colours a message line.
+_SEVERITY_CLASS = {"information": "-info", "warning": "-warning", "error": "-error"}
+
+
+class MessageItem(Static):
+    """One line in the MessageStack, carrying its text and severity for tests."""
+
+    def __init__(self, text: str, severity: str):
+        super().__init__(text, classes="msg")
+        self.message_text = text
+        self.severity = severity
+        self.add_class(_SEVERITY_CLASS.get(severity, "-info"))
+
+    def set_content(self, text: str, severity: str):
+        self.message_text = text
+        self.severity = severity
+        for cls in _SEVERITY_CLASS.values():
+            self.remove_class(cls)
+        self.add_class(_SEVERITY_CLASS.get(severity, "-info"))
+        self.update(text)
+
+
+class MessageStack(Vertical):
+    """Inline, auto-expiring message area above the footer — bucklet's only
+    notification surface (there are no toasts).
+
+    Each line carries a severity (colour) and a timeout, after which it removes
+    itself, so the stack stays compact and nothing lingers. Posting with a
+    ``key`` updates the existing line in place and restarts its timer instead of
+    stacking a new one — that's how a stream of progress updates stays one line.
+    Oldest lines are trimmed once the stack exceeds :data:`MAX`.
+    """
+
+    MAX = 5
+
+    DEFAULT_CSS = """
+    MessageStack {
+        height: auto;
+        max-height: 6;
+        padding: 0 1;
+    }
+    MessageStack .msg { height: 1; color: $text-muted; }
+    MessageStack .msg.-warning { color: $warning; text-style: bold; }
+    MessageStack .msg.-error { color: $error; text-style: bold; }
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._items: list[MessageItem] = []
+        self._keyed: dict[str, MessageItem] = {}
+        # Note: not `_timers` — that name belongs to Textual's MessagePump.
+        self._expiry: dict[MessageItem, Timer] = {}
+
+    @property
+    def messages(self) -> list[tuple[str, str]]:
+        """The currently shown (text, severity) pairs, oldest first."""
+        return [(item.message_text, item.severity) for item in self._items]
+
+    def post(self, text: str, *, severity: str = "information", timeout: float = 5.0, key=None):
+        if not text:
+            if key is not None and key in self._keyed:
+                self._expire(self._keyed[key])
+            return
+        if key is not None and key in self._keyed:
+            item = self._keyed[key]
+            item.set_content(text, severity)
+            self._arm(item, timeout)
+            return
+        item = MessageItem(text, severity)
+        self._items.append(item)
+        if key is not None:
+            self._keyed[key] = item
+        self.mount(item)
+        self._arm(item, timeout)
+        self._trim()
+
+    def _arm(self, item: MessageItem, timeout: float):
+        old = self._expiry.pop(item, None)
+        if old is not None:
+            old.stop()
+        self._expiry[item] = self.set_timer(timeout, lambda: self._expire(item))
+
+    def _expire(self, item: MessageItem):
+        timer = self._expiry.pop(item, None)
+        if timer is not None:
+            timer.stop()
+        if item in self._items:
+            self._items.remove(item)
+        for k in [k for k, v in self._keyed.items() if v is item]:
+            del self._keyed[k]
+        try:
+            item.remove()
+        except Exception:
+            pass  # already detached
+
+    def _trim(self):
+        while len(self._items) > self.MAX:
+            self._expire(self._items[0])
+
+
 class BuckletApp(App):
     TITLE = "bucklet"
 
     CSS = """
     #bar { height: 1; background: $panel; color: $text; padding: 0 1; }
-    #message { height: 1; padding: 0 1; color: $text-muted; }
-    #message.error { color: $error; text-style: bold; }
     DataTable { height: 1fr; }
 
     DetailScreen, PromptScreen, ProfileScreen, AddProfileScreen, UploadScreen,
@@ -145,7 +248,7 @@ class BuckletApp(App):
         yield Header(show_clock=False)
         yield Static(id="bar")
         yield DataTable(id="objects", zebra_stripes=True, cursor_type="row")
-        yield Static(id="message")
+        yield MessageStack(id="messages")
         yield BuckletFooter()
 
     def on_mount(self):
@@ -159,19 +262,19 @@ class BuckletApp(App):
         if self.service is not None:
             self.reload()
         elif self._initial_profile is not None:
-            self.set_message(f"opening {self._initial_profile.name}…")
+            self.flash(f"opening {self._initial_profile.name}…", key="status", timeout=10.0)
             self._open_worker(self._initial_profile)
         elif self._initial_error:
-            self.set_message(self._initial_error, error=True)
+            self.flash(self._initial_error, severity="error", timeout=8.0)
         else:
-            self.set_message("no profile open. press a to add one or p to switch")
+            self.flash("no profile open. press a to add one or p to switch", timeout=10.0)
         self.set_interval(20.0, self.poll_thawing)
 
     def reload(self):
         if self.service is None:
             return
         self.statuses = {}
-        self.set_message("loading…")
+        self.flash("loading…", key="status", timeout=10.0)
         self._load_worker()
 
     @work(thread=True, exclusive=True, group="load")
@@ -187,7 +290,10 @@ class BuckletApp(App):
             # rows left over from a previous profile so we never show stale data,
             # and surface the error. The user can still switch/add a profile.
             self.call_from_thread(self._populate, [])
-            self.call_from_thread(self.set_message, f"list error: {exc}", True)
+            # Replace the "loading…" line (key="status") with the error.
+            self.call_from_thread(
+                self.flash, f"list error: {exc}", severity="error", timeout=8.0, key="status"
+            )
             return
         if worker.is_cancelled:
             return
@@ -200,7 +306,7 @@ class BuckletApp(App):
                 status = service.status(obj.key)
                 self.call_from_thread(self._apply_status, status)
         self.call_from_thread(self.refresh_view)
-        self.call_from_thread(self.set_message, "")
+        self.call_from_thread(self.flash, "", key="status")  # clear "loading…"
 
     def _populate(self, objects: list[ObjectInfo]):
         self.objects = objects
@@ -259,11 +365,15 @@ class BuckletApp(App):
 
         bar = self.query_one("#bar", Static)
         if self.service is None:
-            self.sub_title = "no profile"
+            self.title = "bucklet"
+            self.sub_title = ""
             bar.update("no profile open")
             return
         prof = self.service.profile
-        self.sub_title = f"{prof.name} · {prof.bucket}"
+        # The header carries the profile + region; the bar carries the bucket and
+        # counts, so the two don't repeat each other.
+        self.title = f"bucklet · profile '{prof.name}' · region {prof.region or '?'}"
+        self.sub_title = ""
         counts = {state: 0 for state in storage.STATES}
         for obj in self.objects:
             state = self._state_of(obj)
@@ -274,7 +384,7 @@ class BuckletApp(App):
         # can't be misread as console markup. State counts wear their state
         # colour; an active filter/search is bold so it stands out (it replaces
         # the old toast — the table above already reflects the change).
-        text = Text(f"{prof.bucket} [{prof.region or '?'}]   ", style="dim")
+        text = Text(f"{prof.bucket}   ", style="dim")
         text.append(f"{len(self.objects)} objects · ")
         text.append(f"cold {counts[storage.COLD]}", style=STATE_STYLE[storage.COLD])
         text.append(" · ")
@@ -295,12 +405,27 @@ class BuckletApp(App):
             text.append(f"/{self.search_term}", style="bold cyan")
         bar.update(text)
 
-    def set_message(self, text: str, error: bool = False):
-        message = self.query_one("#message", Static)
-        message.set_class(error, "error")
-        message.update(text)
-        if error and text:
-            self.notify(text, severity="error")
+    def flash(
+        self,
+        text: str,
+        *,
+        severity: str = "information",
+        timeout: float = 5.0,
+        key: str | None = None,
+    ):
+        """Show a message in the stack above the footer (bucklet's only notifier).
+
+        Every message expires after ``timeout`` seconds. Pass a ``key`` to update
+        one line in place (e.g. a progress readout) instead of stacking; posting
+        empty text for a key clears it.
+        """
+        from textual.css.query import NoMatches
+
+        try:
+            stack = self.query_one(MessageStack)
+        except NoMatches:
+            return  # stack not mounted yet / already torn down
+        stack.post(text, severity=severity, timeout=timeout, key=key)
 
     def poll_thawing(self):
         if self.service is None:
@@ -329,7 +454,7 @@ class BuckletApp(App):
 
     def _require_service(self):
         if self.service is None:
-            self.notify("open a profile first (a / p)", severity="warning")
+            self.flash("open a profile first (a / p)", severity="warning")
             return False
         return True
 
@@ -380,22 +505,26 @@ class BuckletApp(App):
             return
         state = self._state_of(obj)
         if not storage.can_thaw(state):
-            self.notify(f"{obj.key} is {state}, no thaw needed", severity="warning")
+            self.flash(f"{obj.key} is {state}, no thaw needed", severity="warning")
             return
         self._thaw_worker(obj.key, tier)
 
     @work(thread=True, group="op")
     def _thaw_worker(self, key: str, tier: str):
         service = self.service
-        self.call_from_thread(self.set_message, f"requesting {tier} restore: {key}…")
+        self.call_from_thread(
+            self.flash, f"requesting {tier} restore: {key}…", key="op", timeout=10.0
+        )
         try:
             message = service.restore(key, tier=tier)
             status = service.status(key)
         except BuckletError as exc:
-            self.call_from_thread(self.set_message, f"{key}: {exc}", True)
+            self.call_from_thread(
+                self.flash, f"{key}: {exc}", severity="error", timeout=8.0, key="op"
+            )
             return
         self.call_from_thread(self._apply_status, status)
-        self.call_from_thread(self.set_message, f"{key}: {message}")
+        self.call_from_thread(self.flash, f"{key}: {message}", key="op")
 
     def action_download(self):
         if not self._require_service():
@@ -406,9 +535,9 @@ class BuckletApp(App):
         state = self._state_of(obj)
         if not storage.can_download(state):
             if storage.can_thaw(state):
-                self.notify(f"{obj.key} is cold, thaw it first (t)", severity="warning")
+                self.flash(f"{obj.key} is cold, thaw it first (t)", severity="warning")
             else:
-                self.notify(f"{obj.key} is {state}, not ready", severity="warning")
+                self.flash(f"{obj.key} is {state}, not ready", severity="warning")
             return
         self._download_worker(obj.key, obj.size)
 
@@ -422,15 +551,20 @@ class BuckletApp(App):
         def progress(n: int):
             sent["n"] += n
             self.call_from_thread(
-                self.set_message, f"downloading {key}… {sent['n'] * 100 // total}%"
+                self.flash,
+                f"downloading {key}… {sent['n'] * 100 // total}%",
+                key="op",
+                timeout=15.0,
             )
 
         try:
             service.download(key, dest, progress=progress)
         except BuckletError as exc:
-            self.call_from_thread(self.set_message, f"{key}: {exc}", True)
+            self.call_from_thread(
+                self.flash, f"{key}: {exc}", severity="error", timeout=8.0, key="op"
+            )
             return
-        self.call_from_thread(self.set_message, f"{key}: downloaded -> {dest}")
+        self.call_from_thread(self.flash, f"{key}: downloaded -> {dest}", key="op")
 
     def action_delete(self):
         # check_action gates this off the footer, but guard anyway: a stray key
@@ -456,16 +590,18 @@ class BuckletApp(App):
         service = self.service
         if service is None:
             return
-        self.call_from_thread(self.set_message, f"deleting {key}…")
+        self.call_from_thread(self.flash, f"deleting {key}…", key="op", timeout=10.0)
         try:
             message = service.delete(key)
         except BuckletError as exc:
             # A failed delete (commonly access denied on archive-only keys) must
             # leave the object exactly where it was, both on S3 and on screen.
-            self.call_from_thread(self.set_message, f"{key}: {exc}", True)
+            self.call_from_thread(
+                self.flash, f"{key}: {exc}", severity="error", timeout=8.0, key="op"
+            )
             return
         self.call_from_thread(self._remove_object, key)
-        self.call_from_thread(self.set_message, message)
+        self.call_from_thread(self.flash, message, key="op")
 
     def _remove_object(self, key: str):
         """Drop a deleted object from the view without re-listing the bucket."""
@@ -490,10 +626,10 @@ class BuckletApp(App):
         try:
             plan = service.plan_upload([path], prefix=prefix)
         except BuckletError as exc:
-            self.call_from_thread(self.set_message, str(exc), True)
+            self.call_from_thread(self.flash, str(exc), severity="error", timeout=8.0, key="op")
             return
         if not plan:
-            self.call_from_thread(self.set_message, "nothing to upload")
+            self.call_from_thread(self.flash, "nothing to upload", key="op")
             return
 
         # Throttle UI updates to whole-percent / file boundaries: with many
@@ -508,7 +644,10 @@ class BuckletApp(App):
                 return
             last["pct"], last["done"] = pct, done
             self.call_from_thread(
-                self.set_message, f"uploading {done}/{total_files} files… {pct}%"
+                self.flash,
+                f"uploading {done}/{total_files} files… {pct}%",
+                key="op",
+                timeout=15.0,
             )
 
         results = service.upload_many(plan, storage_class=storage_class, progress=progress)
@@ -523,12 +662,14 @@ class BuckletApp(App):
             key, err = failures[0]
             extra = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
             self.call_from_thread(
-                self.set_message,
+                self.flash,
                 f"{len(failures)}/{len(results)} failed — {key}: {err}{extra}",
-                True,
+                severity="error",
+                timeout=8.0,
+                key="op",
             )
         else:
-            self.call_from_thread(self.set_message, f"uploaded {len(results)} file(s)")
+            self.call_from_thread(self.flash, f"uploaded {len(results)} file(s)", key="op")
 
     def action_settings(self):
         if not self._require_service():
@@ -557,7 +698,9 @@ class BuckletApp(App):
             except OSError as exc:
                 # The in-memory profile still reflects the change; just tell the
                 # user it didn't reach disk rather than crash the callback.
-                self.set_message(f"applied, but could not save config: {exc}", True)
+                self.flash(
+                    f"applied, but could not save config: {exc}", severity="error", timeout=8.0
+                )
                 return
         # Rebuild the client so the (locally constructed, no-network) pool sizing
         # reflects the new concurrency. The listing and filters are left as-is.
@@ -565,13 +708,13 @@ class BuckletApp(App):
         try:
             self.service = Service(profile, s3.build_client(profile))
         except BuckletError as exc:
-            self.set_message(str(exc), True)
+            self.flash(str(exc), severity="error", timeout=8.0)
             return
         try:
             old_client.close()  # release the previous pool's connections
         except Exception:
             pass
-        self.set_message("settings updated")
+        self.flash("settings updated")
 
     def action_refresh(self):
         if self._require_service():
@@ -596,7 +739,7 @@ class BuckletApp(App):
     def action_switch_profile(self):
         names = self.config.names()
         if not names:
-            self.notify("no saved profiles. press a to add one", severity="warning")
+            self.flash("no saved profiles. press a to add one", severity="warning")
             return
         labels = []
         for name in names:
@@ -625,7 +768,9 @@ class BuckletApp(App):
         try:
             service = Service.open(profile)
         except BuckletError as exc:
-            self.call_from_thread(self.set_message, f"cannot open '{profile.name}': {exc}", True)
+            self.call_from_thread(
+                self.flash, f"cannot open '{profile.name}': {exc}", severity="error", timeout=8.0
+            )
             return
         self.call_from_thread(self._activate, service)
 
@@ -633,7 +778,7 @@ class BuckletApp(App):
         self.service = service
         self.search_term = ""
         self.state_filter = None
-        self.set_message(f"opened profile '{service.profile.name}'")
+        self.flash(f"opened profile '{service.profile.name}'")
         self.reload()
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Select, Static
 
@@ -37,7 +37,7 @@ class DetailScreen(ModalScreen[None]):
         self._lines = lines
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
+        with VerticalScroll(id="dialog"):
             yield Label(self._title, classes="dialog-title")
             yield Static("\n".join(self._lines))
             yield Label("esc / enter to close", classes="hint")
@@ -66,7 +66,7 @@ class ConfirmScreen(ModalScreen[bool]):
         self._confirm_label = confirm_label
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
+        with VerticalScroll(id="dialog"):
             yield Label(self._title, classes="dialog-title")
             yield Static("\n".join(self._lines))
             yield Label("y to confirm · n / esc to cancel", classes="hint")
@@ -97,7 +97,7 @@ class PromptScreen(ModalScreen[str | None]):
         self._value = value
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
+        with VerticalScroll(id="dialog"):
             yield Label(self._label, classes="dialog-title")
             yield Input(value=self._value, id="value")
             yield Label("enter to apply · esc to cancel", classes="hint")
@@ -124,7 +124,7 @@ class ProfileScreen(ModalScreen[str | None]):
         self._labels = labels
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
+        with VerticalScroll(id="dialog"):
             yield Label("Switch profile", classes="dialog-title")
             yield OptionList(*self._labels, id="profiles")
             yield Label("enter to open · esc to cancel", classes="hint")
@@ -208,7 +208,7 @@ class UploadScreen(ModalScreen[dict | None]):
         self._default_class = default_class
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
+        with VerticalScroll(id="dialog"):
             yield Label("Upload", classes="dialog-title")
             yield Label("path (file or directory)")
             yield Input(id="path", placeholder="/path/to/file")
