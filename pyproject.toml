@@ -1,0 +1,33 @@
+[project]
+name = "archy"
+version = "0.1.0"
+description = "Browse, upload, download and restore objects across S3 buckets — any storage class — from a CLI or a Textual TUI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.43.18",
+    "textual>=8.2.7",
+]
+
+[project.scripts]
+archy = "archy.cli:main"
+
+[project.urls]
+Repository = "https://github.com/tomasvana/archy"
+
+[build-system]
+requires = ["uv_build>=0.11.2,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "moto[s3]>=5.2.1",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+]

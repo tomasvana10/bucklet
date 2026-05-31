@@ -1,0 +1,220 @@
+"""End-to-end CLI tests (config CRUD without AWS, object ops against moto)."""
+
+from archy.cli import main
+
+
+# -- profile management (no AWS) ------------------------------------------- #
+def test_profile_add_and_ls(config_dir, capsys):
+    assert main(["profile", "add", "p", "--bucket", "b", "--region", "us-east-1", "--class", "standard"]) == 0
+    capsys.readouterr()
+    assert main(["profile", "ls"]) == 0
+    out = capsys.readouterr().out
+    assert "p" in out and "b" in out and "standard" in out
+
+
+def test_unknown_class_returns_error(config_dir, capsys):
+    assert main(["profile", "add", "p", "--bucket", "b", "--class", "frostbite"]) == 1
+    assert "frostbite" in capsys.readouterr().err
+
+
+def test_ls_without_profile_errors(config_dir, capsys):
+    assert main(["ls"]) == 1
+    assert "no profile" in capsys.readouterr().err
+
+
+def test_profile_show_archival_note(config_dir, capsys):
+    main(["profile", "add", "cold", "--bucket", "b", "--class", "deep_archive"])
+    capsys.readouterr()
+    assert main(["profile", "show", "cold"]) == 0
+    out = capsys.readouterr().out
+    assert "DEEP_ARCHIVE" in out and "thaw" in out
+
+
+# -- object operations (moto) ---------------------------------------------- #
+def _add_profile(bucket, cls="standard"):
+    main(["profile", "add", "p", "--bucket", bucket, "--region", "us-east-1",
+          "--class", cls, "--access-key", "testing", "--secret", "testing"])
+
+
+def test_up_ls_stat_cycle(config_dir, s3_client, capsys, tmp_path):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    f = tmp_path / "doc.txt"
+    f.write_text("hello")
+    key = str(f.resolve()).lstrip("/")
+    capsys.readouterr()
+
+    assert main(["up", str(f), "--profile", "p"]) == 0
+    assert main(["ls", "--profile", "p"]) == 0
+    assert key in capsys.readouterr().out
+
+    assert main(["stat", key, "--profile", "p"]) == 0
+    assert "STANDARD" in capsys.readouterr().out
+
+
+def test_global_profile_before_subcommand(config_dir, s3_client, capsys):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    capsys.readouterr()
+    # --profile given before the subcommand must work too
+    assert main(["--profile", "p", "ls"]) == 0
+
+
+def test_up_with_class_override(config_dir, s3_client, capsys, tmp_path):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket", cls="standard")  # profile default standard
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    key = str(f.resolve()).lstrip("/")
+    capsys.readouterr()
+    # override to deep_archive on this upload only
+    assert main(["up", str(f), "--class", "deep_archive", "--profile", "p"]) == 0
+    main(["stat", key, "--profile", "p"])
+    assert "DEEP_ARCHIVE" in capsys.readouterr().out
+
+
+def test_thaw_standard_object_is_noop(config_dir, s3_client, capsys, tmp_path):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    f = tmp_path / "f"
+    f.write_text("x")
+    main(["up", str(f), "--profile", "p"])
+    key = str(f.resolve()).lstrip("/")
+    capsys.readouterr()
+    assert main(["thaw", key, "--profile", "p"]) == 0
+    assert "no thaw needed" in capsys.readouterr().out
+
+
+def test_get_downloads(config_dir, s3_client, capsys, tmp_path, monkeypatch):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    f = tmp_path / "src.txt"
+    f.write_text("payload")
+    main(["up", str(f), "--profile", "p"])
+    key = str(f.resolve()).lstrip("/")
+
+    outdir = tmp_path / "downloads"
+    capsys.readouterr()
+    assert main(["get", key, "-o", str(outdir), "--profile", "p"]) == 0
+    assert (outdir / key).read_text() == "payload"
+
+
+# -- error paths / exit codes ---------------------------------------------- #
+def test_get_missing_key_exit_1(config_dir, s3_client, capsys):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    capsys.readouterr()
+    assert main(["get", "no-such-key", "--profile", "p"]) == 1
+    assert "no match" in capsys.readouterr().err
+
+
+def test_thaw_glob_no_match_exit_1(config_dir, s3_client, capsys):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    capsys.readouterr()
+    assert main(["thaw", "nothing-*", "--profile", "p"]) == 1
+    assert "no match" in capsys.readouterr().err
+
+
+def test_stat_missing_exit_1(config_dir, s3_client, capsys):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    capsys.readouterr()
+    assert main(["stat", "ghost", "--profile", "p"]) == 1
+    assert "no match" in capsys.readouterr().err
+
+
+def test_get_download_error_exit_1(config_dir, s3_client, capsys, tmp_path, monkeypatch):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    f = tmp_path / "f"
+    f.write_text("x")
+    main(["up", str(f), "--profile", "p"])
+    key = str(f.resolve()).lstrip("/")
+
+    from archy.errors import ArchyError
+    from archy.service import Service
+
+    def boom(self, key, dest, progress=None):
+        raise ArchyError("not restored yet — thaw it first")
+
+    monkeypatch.setattr(Service, "download", boom)
+    capsys.readouterr()
+    assert main(["get", key, "-o", str(tmp_path / "out"), "--profile", "p"]) == 1
+    out = capsys.readouterr().out
+    assert "ERR" in out and "not restored" in out
+
+
+# -- ls flags -------------------------------------------------------------- #
+def test_ls_long_search_and_state(config_dir, s3_client, capsys, tmp_path):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")  # standard default
+    warm = tmp_path / "warm.txt"
+    warm.write_text("1")
+    cold = tmp_path / "cold.bin"
+    cold.write_text("2")
+    main(["up", str(warm), "--profile", "p"])
+    main(["up", str(cold), "--class", "deep_archive", "--profile", "p"])
+    kw = str(warm.resolve()).lstrip("/")
+    kc = str(cold.resolve()).lstrip("/")
+
+    capsys.readouterr()
+    assert main(["ls", "-l", "--profile", "p"]) == 0
+    long_out = capsys.readouterr().out
+    assert "STANDARD" in long_out and "DEEP_ARCHIVE" in long_out and "cold" in long_out
+
+    assert main(["ls", "--search", "cold.bin", "--profile", "p"]) == 0
+    search_out = capsys.readouterr().out
+    assert kc in search_out and kw not in search_out
+
+    assert main(["ls", "--state", "cold", "--profile", "p"]) == 0
+    cold_out = capsys.readouterr().out
+    assert kc in cold_out and kw not in cold_out
+
+    assert main(["ls", "--state", "available", "--profile", "p"]) == 0
+    avail_out = capsys.readouterr().out
+    assert kw in avail_out and kc not in avail_out
+
+
+# -- thaw tier selection --------------------------------------------------- #
+def test_thaw_standard_tier_is_passed(config_dir, s3_client, capsys, tmp_path, monkeypatch):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket", cls="deep_archive")
+    f = tmp_path / "f"
+    f.write_text("x")
+    main(["up", str(f), "--profile", "p"])
+    key = str(f.resolve()).lstrip("/")
+
+    from archy.service import Service
+
+    captured = {}
+
+    def spy(self, key, *, tier="Bulk", days=7):
+        captured["tier"] = tier
+        return "ok"
+
+    monkeypatch.setattr(Service, "restore", spy)
+    capsys.readouterr()
+    assert main(["thaw", key, "--standard", "--profile", "p"]) == 0
+    assert captured["tier"] == "Standard"
+
+
+# -- no subcommand launches the TUI ---------------------------------------- #
+def test_no_subcommand_launches_tui(config_dir, monkeypatch):
+    from archy.tui import app as app_mod
+
+    called = {}
+
+    def fake_run_tui(config, profile_arg=None):
+        called["profile"] = profile_arg
+
+    monkeypatch.setattr(app_mod, "run_tui", fake_run_tui)
+    assert main([]) == 0
+    assert called == {"profile": None}
+
+
+def test_profile_flag_after_profile_subcommand(config_dir, capsys):
+    # the documented "before or after" contract must hold for profile commands too
+    main(["profile", "add", "p", "--bucket", "b"])
+    capsys.readouterr()
+    assert main(["profile", "ls", "--profile", "p"]) == 0  # must not argparse-exit(2)
