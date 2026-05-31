@@ -50,9 +50,9 @@ The package is a stack. Lower layers know nothing about the ones above them.
 
 `service.Service` is where the work happens. It binds a resolved profile to a
 boto3 client and exposes plain methods: `list_objects`, `status`, `restore`,
-`download`, `upload`, `delete`, `resolve_keys`. The CLI and the TUI both call
-those and only deal with presenting the results. Add a capability to the service
-and both front-ends can use it.
+`download`, `upload`, `upload_many`, `delete`, `resolve_keys`. The CLI and the
+TUI both call those and only deal with presenting the results. Add a capability
+to the service and both front-ends can use it.
 
 The one exception is `delete`: the capability lives in the service like the
 rest, but only the TUI surfaces it (see "Deletion"). The CLI never calls it.
@@ -91,6 +91,26 @@ opens in a worker too, which is why the window appears at once instead of
 waiting on a `head_bucket` round trip. Archived objects get a `head_object` only
 when a listing can't reveal their state, so a plain bucket loads in one call.
 
+### Uploading many files
+
+`Service.upload_many` uploads a plan of `(local, key)` pairs through a
+`ThreadPoolExecutor`. boto3 already parallelises the *parts* of one large file;
+this adds *file-level* parallelism, which is the win for many small/medium files
+where each is a single round-trip. A failure on one file is captured and
+returned as `(key, error)` rather than aborting the batch — an archive key that
+can't write one object shouldn't sink the rest. The boto3 client's
+`max_pool_connections` is sized from the profile's concurrency (files × parts)
+so the parallel transfers don't starve each other on a default pool of 10.
+
+### Transfer tuning
+
+The multipart thresholds and the two concurrency knobs are per-profile, each
+optional and defaulting to a shared constant (see `models.TUNABLES`, the single
+source of truth that drives both `profile tune` and the TUI settings screen). A
+knob is stored only when set, so "reset to default" is just removing it — which
+is why the TUI exposes reset as "clear the field". `Profile.tuning` resolves the
+stored values plus defaults into a `Tuning` the s3 layer reads per transfer.
+
 ### Deletion
 
 Deleting is the one destructive thing bucklet can do, so it is gated three ways.
@@ -114,6 +134,18 @@ to handle.
 The config lives at the platform's per-user config path (`~/.config/bucklet` on
 Linux), located with `platformdirs`. Set `$BUCKLET_CONFIG_DIR` to override it,
 which is how the tests keep their config out of your home directory.
+
+### Versioning and migrations
+
+The file carries a `version`. On load, `config._migrate` walks it up to
+`CONFIG_VERSION` one step at a time, so adding a new format is just appending the
+next `if version < N:` block — each step reshapes the dict and bumps `version`.
+A file with no `version` is the original pre-versioning layout, treated as v1
+(the same shape), so it just gains a stamp. The upgrade is written back on load
+(best-effort — a read-only dir won't fail the load), and a config from a *newer*
+bucklet is refused rather than silently downgraded. Every `save` writes the
+current version, so the only thing a new migration has to get right is the
+transform from the previous shape.
 
 ## Tests
 
