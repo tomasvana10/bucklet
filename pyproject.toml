@@ -1,7 +1,7 @@
 [project]
 name = "bucklet"
 version = "0.1.0"
-description = "Browse, upload, download and restore S3 objects in any storage class, from a CLI or a TUI."
+description = "Manage S3 objects in any storage class."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

@@ -18,8 +18,11 @@ What bucklet does:
 
 What it leaves out, on purpose:
 
-- It is not a sync tool. There is no diffing, no mirroring, no delete. Reach for
-  rclone or the AWS CLI when you need those.
+- It is not a sync tool. There is no diffing and no mirroring. Reach for rclone
+  or the AWS CLI when you need those.
+- Deleting objects is supported, but deliberately fenced off: it is offered only
+  in the TUI, only when launched with `--allow-deletion`, and always behind a
+  confirmation. There is no delete subcommand on the CLI. See "Deletion" below.
 - It does not manage buckets, lifecycle rules, or IAM. It assumes the bucket and
   the credentials already exist.
 - It keeps no database or local cache. Every listing and status comes straight
@@ -47,9 +50,12 @@ The package is a stack. Lower layers know nothing about the ones above them.
 
 `service.Service` is where the work happens. It binds a resolved profile to a
 boto3 client and exposes plain methods: `list_objects`, `status`, `restore`,
-`download`, `upload`, `resolve_keys`. The CLI and the TUI both call those and
-only deal with presenting the results. Add a capability to the service and both
-front-ends can use it.
+`download`, `upload`, `delete`, `resolve_keys`. The CLI and the TUI both call
+those and only deal with presenting the results. Add a capability to the service
+and both front-ends can use it.
+
+The one exception is `delete`: the capability lives in the service like the
+rest, but only the TUI surfaces it (see "Deletion"). The CLI never calls it.
 
 ### The pure layer
 
@@ -84,6 +90,24 @@ runs in a worker thread and reports back with `call_from_thread`. The profile
 opens in a worker too, which is why the window appears at once instead of
 waiting on a `head_bucket` round trip. Archived objects get a `head_object` only
 when a listing can't reveal their state, so a plain bucket loads in one call.
+
+### Deletion
+
+Deleting is the one destructive thing bucklet can do, so it is gated three ways.
+The capability lives on the service (`Service.delete`, over the thin
+`s3.delete_object` wrapper), but it is reachable only from the TUI, only when the
+process was started with `--allow-deletion`, and only after a confirmation
+dialog. The flag flows `cli.main` → `run_tui` → `BuckletApp(allow_deletion=…)`;
+when it is off, `App.check_action` hides the `d` binding from the footer and
+makes the key a no-op, and `action_delete` re-checks the flag as a backstop.
+
+Failed deletes are expected, not exceptional: an archive-only key that lacks
+`s3:DeleteObject` raises `AccessDenied`, which `s3.delete_object` turns into a
+`BuckletError`. The TUI shows that as an error toast and leaves the object on
+screen, because it is still in the bucket. Only a successful delete drops the row
+(removed locally, with no re-list, so deletion still works on buckets whose
+listing is flaky). S3 deletion is idempotent, so there is no "already gone" case
+to handle.
 
 ## Configuration
 

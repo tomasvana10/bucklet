@@ -1,16 +1,24 @@
 # bucklet
 
-Bucklet is a small CLI/TUI tool for managing objects in S3 compatible buckets.
+Bucklet is a small CLI/TUI tool for managing objects in S3 compatible buckets, with support for all storage classes.
 
 ## Install
 
-Python >=3.10 required
+Python >=3.10 is required.
 
-1. `pip install bucklet`
+1. Install the `bucklet` package from PyPI:
+
+```bash
+# using pipx
+pipx ensurepath && pipx install bucklet
+
+# using uv
+uv tool install bucklet
+```
 
 2. Optionally, install shell completion:
 
-```sh
+```bash
 # fish
 register-python-argcomplete --shell fish bucklet > ~/.config/fish/completions/bucklet.fish
 
@@ -26,10 +34,13 @@ Add-Content $PROFILE 'register-python-argcomplete --shell powershell bucklet | O
 
 3. Run `bucklet` to open the TUI and configure a profile with your S3 credentials.
 
+> [!IMPORTANT]
+> Deletion of objects is only supported through the TUI when launched with the `--allow-deletion` flag.
+
 ## Usage
 
 ```
-bucklet [-h] [--profile NAME] {up,get,thaw,ls,stat,profile} ...
+bucklet [-h] [--profile NAME] [--allow-deletion] {up,get,thaw,ls,stat,profile} ...
 
 positional arguments:
   {up,get,thaw,ls,stat,profile}
@@ -43,25 +54,26 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --profile NAME        profile to use (a saved name, or a raw bucket name); defaults to the configured default profile
+  --allow-deletion      allow deleting objects in the TUI (no effect on the subcommands)
 ```
 
 ## Development
 
-- Set up the environment:
+Set up the environment:
 
 ```bash
 uv sync
 pre-commit install
 ```
 
-- Test the project:
+Test the project:
 
 ```bash
 uv run pytest
 uv run pytest --cov=bucklet
 ```
 
-- Run the project:
+Run the project:
 
 ```bash
 uv run bucklet
