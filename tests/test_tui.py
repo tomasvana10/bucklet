@@ -577,10 +577,11 @@ async def test_messages_expire(tmp_path):
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        app.flash("blip", timeout=0.05)
-        await pilot.pause()
+        app.flash("blip", timeout=0.1)
+        # present synchronously — assert before any await so the timer (which
+        # only fires on the event loop) can't race us on a slow CI runner.
         assert _has_message(app, "blip")
-        await asyncio.sleep(0.15)  # let the expiry timer fire
+        await asyncio.sleep(0.5)  # comfortably past the timeout
         await pilot.pause()
         assert not _has_message(app, "blip")
 
@@ -599,20 +600,22 @@ async def test_empty_text_clears_keyed_message(tmp_path):
 
 
 async def test_keyed_update_restarts_expiry_timer(tmp_path):
-    """A keyed line being updated must not expire on its original timer —
-    otherwise a long progress stream would vanish mid-transfer."""
-    import asyncio
+    """A keyed update must restart the line's expiry timer — otherwise a long
+    progress stream would vanish mid-transfer. Checked deterministically (the
+    timer object is replaced) rather than by racing the clock."""
+    from bucklet.tui.app import MessageStack
 
     app = _app(tmp_path, FakeService())
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        app.flash("progress 10%", key="op", timeout=0.3)
-        await asyncio.sleep(0.2)  # most of the original timeout elapses
-        app.flash("progress 90%", key="op", timeout=0.3)  # update restarts it
-        await asyncio.sleep(0.2)  # past the ORIGINAL deadline, within the new one
-        await pilot.pause()
-        assert _has_message(app, "progress 90%")  # still here -> timer restarted
+        stack = app.query_one(MessageStack)
+        app.flash("progress 10%", key="op", timeout=30.0)
+        item = stack._keyed["op"]
+        first_timer = stack._expiry[item]
+        app.flash("progress 90%", key="op", timeout=30.0)  # update -> re-arm
+        assert stack._keyed["op"] is item  # same line, updated in place
+        assert stack._expiry[item] is not first_timer  # timer was restarted
 
 
 async def test_keyed_severity_change(tmp_path):
