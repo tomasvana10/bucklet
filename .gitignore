@@ -6,3 +6,7 @@ wheels/
 *.egg-info
 .env
 .venv
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
