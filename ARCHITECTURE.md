@@ -73,8 +73,15 @@ needs it. The CLI and the TUI both start before any network code loads.
 ### Errors
 
 Anything a user can act on is raised as `BuckletError` with a short message.
-Front-ends catch it, print the message, and either exit non-zero (CLI) or show a
-toast (TUI). Everything else is a bug and is left to crash with a traceback.
+Front-ends catch it, print the message, and either exit non-zero (CLI) or flash
+it in the message stack (TUI). Everything else is a bug and is left to crash with
+a traceback.
+
+The TUI has no toasts: every message — errors, warnings, progress, results — is
+a timed line in the `MessageStack` above the footer. Lines auto-expire; a `key`
+updates one line in place (so a stream of progress readouts stays a single line)
+and clears it when done. `App.flash(text, *, severity, timeout, key)` is the only
+notification entry point.
 
 ### Credentials
 
@@ -123,7 +130,7 @@ makes the key a no-op, and `action_delete` re-checks the flag as a backstop.
 
 Failed deletes are expected, not exceptional: an archive-only key that lacks
 `s3:DeleteObject` raises `AccessDenied`, which `s3.delete_object` turns into a
-`BuckletError`. The TUI shows that as an error toast and leaves the object on
+`BuckletError`. The TUI flashes that as an error and leaves the object on
 screen, because it is still in the bucket. Only a successful delete drops the row
 (removed locally, with no re-list, so deletion still works on buckets whose
 listing is flaky). S3 deletion is idempotent, so there is no "already gone" case
