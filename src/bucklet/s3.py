@@ -15,7 +15,14 @@ from typing import TYPE_CHECKING
 
 from . import storage
 from .errors import BuckletError
-from .models import ObjectInfo, ObjectStatus, Profile
+from .models import (
+    DEFAULT_MULTIPART_CHUNKSIZE,
+    DEFAULT_MULTIPART_THRESHOLD,
+    DEFAULT_PART_CONCURRENCY,
+    ObjectInfo,
+    ObjectStatus,
+    Profile,
+)
 
 if TYPE_CHECKING:
     from botocore.client import BaseClient
@@ -27,10 +34,16 @@ def build_client(profile: Profile):
     import boto3
     from botocore.config import Config
 
+    # Size the connection pool to the profile's concurrency so parallel uploads
+    # (files × per-file parts) don't starve each other on a default pool of 10.
+    # Capped so a fat-fingered tuning value can't ask urllib3 for an absurd pool.
+    tuning = profile.tuning
+    pool = min(128, max(10, tuning.upload_concurrency * tuning.part_concurrency))
     cfg = Config(
         connect_timeout=15,
         read_timeout=70,
         retries={"max_attempts": 3, "mode": "standard"},
+        max_pool_connections=pool,
     )
     kwargs: dict = {"config": cfg}
     if profile.region:
@@ -188,14 +201,23 @@ def upload_file(
     key: str,
     storage_class: str,
     callback: Callable[[int], None] | None = None,
+    *,
+    multipart_threshold: int = DEFAULT_MULTIPART_THRESHOLD,
+    multipart_chunksize: int = DEFAULT_MULTIPART_CHUNKSIZE,
+    max_concurrency: int = DEFAULT_PART_CONCURRENCY,
 ):
-    """Upload a local file to ``key`` in the given storage class."""
+    """Upload a local file to ``key`` in the given storage class.
+
+    The multipart knobs come from the profile's :class:`~bucklet.models.Tuning`;
+    ``max_concurrency`` is how many parts of *this* file upload at once.
+    """
     from boto3.s3.transfer import TransferConfig
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import BotoCoreError, ClientError
 
     transfer = TransferConfig(
-        multipart_threshold=8 * 1024 * 1024,
-        multipart_chunksize=256 * 1024 * 1024,
+        multipart_threshold=multipart_threshold,
+        multipart_chunksize=multipart_chunksize,
+        max_concurrency=max_concurrency,
     )
     try:
         client.upload_file(
@@ -208,3 +230,5 @@ def upload_file(
         )
     except ClientError as exc:
         raise BuckletError(_client_error_message(exc)) from exc
+    except BotoCoreError as exc:
+        raise BuckletError(str(exc) or "upload failed") from exc

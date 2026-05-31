@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import threading
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +26,9 @@ if TYPE_CHECKING:
 
 # A progress callback receives the number of bytes transferred since the last call.
 ProgressCB = Callable[[int], None]
+
+# upload_many reports overall progress as (bytes_sent, bytes_total, files_done, files_total).
+MultiProgressCB = Callable[[int, int, int, int], None]
 
 _GLOB_CHARS = set("*?[]")
 
@@ -106,8 +111,103 @@ class Service:
     ):
         """Upload one file, returning the class it was stored in."""
         resolved = self.resolve_storage_class(storage_class)
-        s3.upload_file(self.client, self.bucket, Path(local_path), key, resolved, callback=progress)
+        t = self.profile.tuning
+        s3.upload_file(
+            self.client,
+            self.bucket,
+            Path(local_path),
+            key,
+            resolved,
+            callback=progress,
+            multipart_threshold=t.multipart_threshold,
+            multipart_chunksize=t.multipart_chunksize,
+            max_concurrency=t.part_concurrency,
+        )
         return resolved
+
+    def upload_many(
+        self,
+        plan: Iterable[tuple[str | os.PathLike, str]],
+        *,
+        storage_class: str | None = None,
+        progress: MultiProgressCB | None = None,
+    ):
+        """Upload many ``(local_path, key)`` pairs, several at a time.
+
+        Concurrency is the profile's ``upload_concurrency``. boto3 already
+        parallelises the *parts* of one large file; this adds file-level
+        parallelism, which is the win for many small/medium files where each is
+        a single round-trip. Returns a list of ``(key, error)`` in plan order,
+        where ``error`` is ``None`` on success or the
+        :class:`~bucklet.errors.BuckletError` that file hit — a single failure
+        never aborts the others (your archive key that can't write one object
+        shouldn't sink the whole batch).
+        """
+        plan = list(plan)
+        if not plan:
+            return []
+        resolved = self.resolve_storage_class(storage_class)
+        t = self.profile.tuning
+        total_bytes = 0
+        for local, _key in plan:
+            try:
+                total_bytes += Path(local).stat().st_size
+            except OSError:
+                pass
+        total_bytes = max(total_bytes, 1)
+        total_files = len(plan)
+        lock = threading.Lock()
+        state = {"sent": 0, "done": 0}
+
+        def report():
+            if progress is None:
+                return
+            # Snapshot under the lock, then call the (possibly slow, possibly
+            # buggy) callback outside it: a progress callback must never hold up
+            # other workers or, by raising, fail an upload that actually worked.
+            with lock:
+                sent, done = state["sent"], state["done"]
+            try:
+                progress(sent, total_bytes, done, total_files)
+            except Exception:
+                pass
+
+        def upload_one(item: tuple[str | os.PathLike, str]):
+            local, key = item
+
+            def cb(n: int):
+                with lock:
+                    state["sent"] += n
+                report()
+
+            try:
+                s3.upload_file(
+                    self.client,
+                    self.bucket,
+                    Path(local),
+                    key,
+                    resolved,
+                    callback=cb,
+                    multipart_threshold=t.multipart_threshold,
+                    multipart_chunksize=t.multipart_chunksize,
+                    max_concurrency=t.part_concurrency,
+                )
+                error: BuckletError | None = None
+            except BuckletError as exc:
+                error = exc
+            except Exception as exc:
+                # Anything s3.upload_file didn't already map (a vanished file,
+                # an OS error) becomes this file's error rather than crashing
+                # the whole batch through pool.map.
+                error = BuckletError(str(exc) or exc.__class__.__name__)
+            with lock:
+                state["done"] += 1
+            report()
+            return (key, error)
+
+        workers = max(1, min(t.upload_concurrency, total_files))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(upload_one, plan))
 
     @staticmethod
     def plan_upload(paths: Iterable[str | os.PathLike], prefix: str = ""):

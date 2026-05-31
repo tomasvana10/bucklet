@@ -20,8 +20,8 @@ from pathlib import Path
 from . import storage
 from .config import Config
 from .errors import BuckletError
-from .formatting import fmt_date, human
-from .models import Profile
+from .formatting import fmt_date, human, parse_size
+from .models import TUNABLES, Profile
 from .service import Service
 
 try:
@@ -180,6 +180,25 @@ def _build_profile_parser(
     show = ps.add_parser("show", parents=[common], help="show a resolved profile")
     show.add_argument("name", nargs="?")
 
+    tune = ps.add_parser(
+        "tune", parents=[common], help="set per-profile transfer tuning (chunk size, concurrency)"
+    )
+    tune.add_argument("name")
+    for t in TUNABLES:
+        tune.add_argument(
+            "--" + t.key.replace("_", "-"),
+            dest=t.key,
+            metavar="SIZE" if t.is_size else "N",
+            help=f"{t.label} (default {_fmt_tunable(t)})",
+        )
+    tune.add_argument(
+        "--reset",
+        nargs="+",
+        metavar="FIELD",
+        choices=[t.key.replace("_", "-") for t in TUNABLES] + ["all"],
+        help="reset the named setting(s) to default ('all' for every one)",
+    )
+
 
 def _profile_arg(args: argparse.Namespace) -> str | None:
     return getattr(args, "profile", None)
@@ -195,22 +214,29 @@ def _open_service(config: Config, args: argparse.Namespace, *, validate: bool = 
     return Service.open(profile, validate=validate)
 
 
-class _Progress:
-    """Tiny single-line percentage reporter for one transfer (to stderr)."""
+class _UploadProgress:
+    """Single-line aggregate progress for a batch upload (to stderr).
 
-    def __init__(self, label: str, size: int):
-        self.label = label
-        self.size = max(size, 1)
-        self.sent = 0
+    Concurrent uploads can't each own a progress line without garbling, so this
+    shows one rolling total. Updates are throttled to whole-percent / file
+    boundaries to keep the write rate sane across many small files.
+    """
 
-    def __call__(self, n: int):
-        self.sent += n
-        pct = min(100, self.sent * 100 // self.size)
-        sys.stderr.write(f"\r    {self.label} {pct:3d}%")
+    def __init__(self):
+        self._last: tuple[int, int] = (-1, -1)
+
+    def __call__(self, sent: int, total: int, done: int, total_files: int):
+        pct = min(100, sent * 100 // total)
+        if (pct, done) == self._last:
+            return
+        self._last = (pct, done)
+        sys.stderr.write(
+            f"\r  {done}/{total_files} files · {human(sent)}/{human(total)} {pct:3d}%   "
+        )
         sys.stderr.flush()
 
-    def done(self, message: str):
-        sys.stderr.write(f"\r    {message}{' ' * 8}\n")
+    def finish(self):
+        sys.stderr.write("\n")
         sys.stderr.flush()
 
 
@@ -221,18 +247,20 @@ def cmd_up(config: Config, args: argparse.Namespace):
         print("nothing to upload.")
         return 0
     cls = service.resolve_storage_class(args.storage_class)
-    rc = 0
-    for i, (local, key) in enumerate(plan, 1):
-        size = local.stat().st_size
-        print(f"[{i}/{len(plan)}] {local} ({human(size)}) -> {key} [{cls.lower()}]")
-        progress = _Progress("up", size)
-        try:
-            service.upload(local, key, storage_class=args.storage_class, progress=progress)
-            progress.done("done")
-        except BuckletError as exc:
-            progress.done(f"error: {exc}")
-            rc = 1
-    return rc
+    conc = service.profile.tuning.upload_concurrency
+    print(f"uploading {len(plan)} file(s) -> [{cls.lower()}], up to {conc} at a time")
+    reporter = _UploadProgress()
+    results = service.upload_many(plan, storage_class=args.storage_class, progress=reporter)
+    reporter.finish()
+    failures = [(key, err) for key, err in results if err is not None]
+    for key, err in failures:
+        print(f"ERR  {key}: {err}")
+    ok = len(results) - len(failures)
+    summary = f"{ok}/{len(results)} uploaded"
+    if failures:
+        summary += f", {len(failures)} failed"
+    print(summary, file=sys.stderr)
+    return 1 if failures else 0
 
 
 def cmd_get(config: Config, args: argparse.Namespace):
@@ -352,13 +380,22 @@ def cmd_profile(config: Config, args: argparse.Namespace):
         return 0
     if pcmd == "show":
         return _profile_show(config, args)
-    raise BuckletError("usage: bucklet profile {add|ls|rm|default|show} ...")
+    if pcmd == "tune":
+        return _profile_tune(config, args)
+    # Unreachable via the CLI: argparse rejects an unknown subcommand (printing
+    # its own usage with the valid choices) long before we get here. No need to
+    # restate the command list and let it drift.
+    raise BuckletError(f"unknown profile subcommand: {pcmd!r}")
 
 
 def _profile_add(config: Config, args: argparse.Namespace):
     cls = storage.DEFAULT_STORAGE_CLASS
     if args.storage_class:
         cls = storage.normalize_storage_class(args.storage_class)
+    # `add` overwrites connection settings, but it has no flags for the transfer
+    # tuning (that's `profile tune`'s job), so carry any existing tuning across
+    # an overwrite rather than silently wiping it.
+    prior = config.stored(args.name) if config.has(args.name) else {}
     profile = Profile(
         name=args.name,
         bucket=args.bucket,
@@ -368,6 +405,10 @@ def _profile_add(config: Config, args: argparse.Namespace):
         rclone_remote=args.rclone_remote,
         endpoint_url=args.endpoint_url,
         storage_class=cls,
+        multipart_threshold=prior.get("multipart_threshold"),
+        multipart_chunksize=prior.get("multipart_chunksize"),
+        upload_concurrency=prior.get("upload_concurrency"),
+        max_concurrency=prior.get("max_concurrency"),
     )
     config.add(profile, make_default=args.default)
     config.save()
@@ -408,6 +449,56 @@ def _profile_show(config: Config, args: argparse.Namespace):
     if profile.has_explicit_keys:
         print(f"key id   : {profile.access_key_id}")
         print("secret   : ****")
+    _print_tuning(profile)
+    return 0
+
+
+def _fmt_tunable(t) -> str:
+    """Human form of a tunable's default (a size or a count)."""
+    return human(t.default) if t.is_size else str(t.default)
+
+
+def _parse_count(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BuckletError(f"expected a whole number, got {raw!r}") from exc
+    if value <= 0:
+        raise BuckletError(f"must be positive: {raw!r}")
+    return value
+
+
+def _print_tuning(profile: Profile):
+    print("tuning   :")
+    for t in TUNABLES:
+        raw = getattr(profile, t.key)
+        effective = t.default if raw is None else raw
+        shown = human(effective) if t.is_size else str(effective)
+        tag = "  (default)" if raw is None else ""
+        print(f"  {t.label:<20} {shown}{tag}")
+
+
+def _profile_tune(config: Config, args: argparse.Namespace):
+    name = args.name
+    if not config.has(name):
+        raise BuckletError(f"no such profile: {name}")
+    stored = config.stored(name)
+    resets = set(getattr(args, "reset", None) or [])
+    if "all" in resets:
+        resets = {t.key.replace("_", "-") for t in TUNABLES}
+    changed = False
+    for t in TUNABLES:
+        raw = getattr(args, t.key, None)
+        if raw is not None:
+            # An explicit value wins over a reset of the same field.
+            stored[t.key] = parse_size(raw) if t.is_size else _parse_count(raw)
+            changed = True
+        elif t.key.replace("_", "-") in resets:
+            if stored.pop(t.key, None) is not None:
+                changed = True
+    if changed:
+        config.save()
+    _print_tuning(config.get(name))
     return 0
 
 

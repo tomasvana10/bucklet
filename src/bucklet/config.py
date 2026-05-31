@@ -4,11 +4,13 @@ The config is a small JSON file living in the user config directory
 (``<config dir>/config.json``)::
 
     {
+      "version": 1,
       "default": "cold",
       "profiles": {
         "cold": {"bucket": "...", "region": "...", "storage_class": "DEEP_ARCHIVE",
                  "rclone_remote": "...", "endpoint_url": null,
-                 "access_key_id": null, "secret_access_key": null}
+                 "access_key_id": null, "secret_access_key": null,
+                 "multipart_chunksize": 67108864}
       }
     }
 
@@ -16,6 +18,11 @@ The config is a small JSON file living in the user config directory
 dicts into fully resolved :class:`~bucklet.models.Profile` objects, with
 credentials filled in from rclone or the environment, and writes changes back
 atomically.
+
+The file carries a ``version``. Older files written before versioning had no
+such key; they are the original layout, which we call v1, so a missing version
+*is* v1. :func:`_migrate` upgrades an older file to the current shape on load
+(see its docstring for how to add the next version).
 """
 
 from __future__ import annotations
@@ -31,6 +38,9 @@ from .errors import BuckletError
 from .models import Profile
 from .rclone import creds_from_rclone
 
+# Bump when the stored shape changes, and add a step to _migrate().
+CONFIG_VERSION = 1
+
 # Persisted profile keys. Everything else on Profile is derived at runtime.
 _STORED_KEYS = (
     "bucket",
@@ -40,7 +50,49 @@ _STORED_KEYS = (
     "rclone_remote",
     "endpoint_url",
     "storage_class",
+    "multipart_threshold",
+    "multipart_chunksize",
+    "upload_concurrency",
+    "max_concurrency",
 )
+
+
+def _migrate(data: dict) -> bool:
+    """Upgrade a parsed config dict in place to :data:`CONFIG_VERSION`.
+
+    Migrations run one version at a time, so growing the format is just adding
+    the next ``if`` below. For example, to introduce v2::
+
+        if version < 2:
+            for prof in data.get("profiles", {}).values():
+                prof["something"] = ...      # reshape each v1 profile
+            version = 2
+
+    A file with no ``version`` predates versioning and is treated as v1 (the
+    same shape), so the only change there is stamping the version. A file from a
+    *newer* bucklet is refused rather than silently downgraded. Returns True if
+    anything changed, so the caller can persist the upgrade.
+    """
+    raw = data.get("version", 1)  # a file with no version is the original == v1
+    version = raw if isinstance(raw, int) and raw >= 1 else 1
+    # Anything that wasn't already a clean version int needs writing back.
+    needs_persist = "version" not in data or raw != version
+    if version > CONFIG_VERSION:
+        raise BuckletError(
+            f"config version {version} is newer than this bucklet understands "
+            f"(v{CONFIG_VERSION}); upgrade bucklet to use it"
+        )
+    start = version
+
+    # --- migration steps (append the next one here) ------------------------
+    # if version < 2:
+    #     ...
+    #     version = 2
+    # -----------------------------------------------------------------------
+
+    version = CONFIG_VERSION
+    data["version"] = version
+    return needs_persist or (version != start)
 
 
 def default_config_dir() -> Path:
@@ -83,10 +135,19 @@ class Config:
             return cls(path)
         if not isinstance(data, dict):
             return cls(path)
+        changed = _migrate(data)  # raises for a config from a newer bucklet
         profiles = data.get("profiles") or {}
         if not isinstance(profiles, dict):
             profiles = {}
-        return cls(path, profiles=profiles, default=data.get("default"))
+        cfg = cls(path, profiles=profiles, default=data.get("default"))
+        if changed:
+            # Make the upgrade durable, but never fail a load over it (the dir
+            # may be read-only); the next explicit save will catch up regardless.
+            try:
+                cfg.save()
+            except OSError:
+                pass
+        return cfg
 
     def save(self):
         """Write the config back atomically, readable only by its owner.
@@ -96,7 +157,10 @@ class Config:
         renamed into place.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"default": self.default, "profiles": self.profiles}, indent=2)
+        payload = json.dumps(
+            {"version": CONFIG_VERSION, "default": self.default, "profiles": self.profiles},
+            indent=2,
+        )
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -129,6 +193,10 @@ class Config:
             rclone_remote=stored.get("rclone_remote"),
             endpoint_url=stored.get("endpoint_url"),
             storage_class=(stored.get("storage_class") or storage.DEFAULT_STORAGE_CLASS),
+            multipart_threshold=stored.get("multipart_threshold"),
+            multipart_chunksize=stored.get("multipart_chunksize"),
+            upload_concurrency=stored.get("upload_concurrency"),
+            max_concurrency=stored.get("max_concurrency"),
         )
         if not prof.has_explicit_keys and prof.rclone_remote:
             rc = creds_from_rclone(prof.rclone_remote) or {}

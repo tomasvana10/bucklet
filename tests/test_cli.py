@@ -273,3 +273,84 @@ def test_profile_completer_lists_saved(config_dir):
 
     main(["profile", "add", "p", "--bucket", "b"])
     assert "p" in _profile_completer()
+
+
+def test_profile_tune_set_and_reset(config_dir, capsys):
+    main(["profile", "add", "p", "--bucket", "b"])
+    capsys.readouterr()
+
+    # set a size and a count
+    rc = main(
+        ["profile", "tune", "p", "--multipart-chunksize", "64MB", "--upload-concurrency", "8"]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "64.0MB" in out and "8" in out
+
+    # the values persist
+    from bucklet.config import Config
+
+    prof = Config.load().get("p")
+    assert prof.multipart_chunksize == 64 * 1024**2
+    assert prof.upload_concurrency == 8
+
+    # reset one of them back to default
+    assert main(["profile", "tune", "p", "--reset", "multipart-chunksize"]) == 0
+    capsys.readouterr()
+    prof = Config.load().get("p")
+    assert prof.multipart_chunksize is None  # reset -> default
+    assert prof.upload_concurrency == 8  # untouched
+
+
+def test_profile_tune_reset_all(config_dir, capsys):
+    main(["profile", "add", "p", "--bucket", "b"])
+    main(["profile", "tune", "p", "--multipart-chunksize", "64MB", "--max-concurrency", "2"])
+    capsys.readouterr()
+    assert main(["profile", "tune", "p", "--reset", "all"]) == 0
+    from bucklet.config import Config
+
+    prof = Config.load().get("p")
+    assert prof.multipart_chunksize is None
+    assert prof.max_concurrency is None
+
+
+def test_profile_tune_rejects_bad_value(config_dir, capsys):
+    main(["profile", "add", "p", "--bucket", "b"])
+    capsys.readouterr()
+    assert main(["profile", "tune", "p", "--multipart-chunksize", "lots"]) == 1
+    assert "size" in capsys.readouterr().err
+
+
+def test_profile_add_preserves_existing_tuning(config_dir, capsys):
+    main(["profile", "add", "p", "--bucket", "b"])
+    main(["profile", "tune", "p", "--upload-concurrency", "8"])
+    capsys.readouterr()
+    # re-adding to change the bucket must not wipe the tuning
+    assert main(["profile", "add", "p", "--bucket", "b2", "--region", "eu-west-1"]) == 0
+    from bucklet.config import Config
+
+    prof = Config.load().get("p")
+    assert prof.bucket == "b2"  # connection settings updated
+    assert prof.upload_concurrency == 8  # tuning preserved
+
+
+def test_profile_show_includes_tuning(config_dir, capsys):
+    main(["profile", "add", "p", "--bucket", "b"])
+    capsys.readouterr()
+    assert main(["profile", "show", "p"]) == 0
+    out = capsys.readouterr().out
+    assert "tuning" in out and "parallel uploads" in out and "(default)" in out
+
+
+def test_up_multiple_files(config_dir, s3_client, capsys, tmp_path):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    paths = []
+    for name in ("one.txt", "two.txt", "three.txt"):
+        f = tmp_path / name
+        f.write_text(name)
+        paths.append(str(f))
+    capsys.readouterr()
+    assert main(["up", *paths, "--profile", "p"]) == 0
+    err = capsys.readouterr().err
+    assert "3/3 uploaded" in err

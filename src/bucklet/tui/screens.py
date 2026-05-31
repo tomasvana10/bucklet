@@ -15,6 +15,9 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, OptionList, Select, Static
 
 from .. import storage
+from ..errors import BuckletError
+from ..formatting import human, parse_count, parse_size
+from ..models import TUNABLES, Profile
 
 _CLASS_OPTIONS = [(c.lower(), c) for c in storage.STORAGE_CLASSES]
 
@@ -233,6 +236,66 @@ class UploadScreen(ModalScreen[dict | None]):
                 "prefix": self.query_one("#prefix", Input).value.strip(),
             }
         )
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class SettingsScreen(ModalScreen[dict | None]):
+    """Edit a profile's transfer tuning.
+
+    One input per :data:`~bucklet.models.TUNABLES` entry, pre-filled with the
+    profile's current value (blank when it uses the default, with the default
+    shown as the placeholder). Saving returns ``{key: int | None}`` where a
+    blank field maps to ``None`` — i.e. clearing a field resets just that one
+    setting to its default.
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, profile: Profile):
+        super().__init__()
+        self._profile = profile
+
+    def _field_id(self, key: str) -> str:
+        return f"tune-{key.replace('_', '-')}"
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="dialog"):
+            yield Label(f"Settings · {self._profile.name}", classes="dialog-title")
+            yield Label("clear a field to reset it to the default", classes="hint")
+            for t in TUNABLES:
+                raw = getattr(self._profile, t.key)
+                default_str = human(t.default) if t.is_size else str(t.default)
+                current = "" if raw is None else (human(raw) if t.is_size else str(raw))
+                yield Label(t.label)
+                yield Input(
+                    value=current,
+                    placeholder=f"default {default_str}",
+                    id=self._field_id(t.key),
+                )
+            with Horizontal(classes="buttons"):
+                yield Button("Save", id="ok", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self):
+        self.query_one(f"#{self._field_id(TUNABLES[0].key)}", Input).focus()
+
+    @on(Button.Pressed, "#ok")
+    def _save(self):
+        values: dict[str, int | None] = {}
+        for t in TUNABLES:
+            text = self.query_one(f"#{self._field_id(t.key)}", Input).value.strip()
+            if not text:
+                values[t.key] = None  # reset to default
+                continue
+            try:
+                values[t.key] = parse_size(text) if t.is_size else parse_count(text)
+            except BuckletError as exc:
+                self.notify(f"{t.label}: {exc}", severity="error")
+                return
+        self.dismiss(values)
 
     @on(Button.Pressed, "#cancel")
     def action_cancel(self):

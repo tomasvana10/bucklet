@@ -29,6 +29,7 @@ from .screens import (
     DetailScreen,
     ProfileScreen,
     PromptScreen,
+    SettingsScreen,
     UploadScreen,
 )
 
@@ -36,6 +37,37 @@ from .screens import (
 COL_STATE, COL_SIZE, COL_MOD, COL_CLASS, COL_KEY = "state", "size", "mod", "class", "key"
 
 _FILTER_CYCLE = [None, storage.COLD, storage.THAWING, storage.THAWED, storage.AVAILABLE]
+
+# Actions that operate on the selected object; greyed out when nothing is listed.
+_OBJECT_ACTIONS = frozenset({"detail", "thaw", "download", "delete"})
+
+
+class BuckletFooter(Footer):
+    """The standard footer, with a divider after the object-specific keys.
+
+    Textual's footer has no notion of sections, so we let it build its keys and
+    then slot a thin divider in after the last object action (Info/Thaw/Get/
+    Delete), separating them from the bucket-wide actions that follow.
+    """
+
+    DEFAULT_CSS = """
+    BuckletFooter .footer-divider {
+        width: 1;
+        color: $foreground 40%;
+        background: $footer-item-background;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        widgets = list(super().compose())
+        last_object_key = -1
+        for i, widget in enumerate(widgets):
+            action = getattr(widget, "action", None)
+            if action and action.split("(", 1)[0] in _OBJECT_ACTIONS:
+                last_object_key = i
+        if 0 <= last_object_key < len(widgets) - 1:
+            widgets.insert(last_object_key + 1, Static("│", classes="footer-divider"))
+        yield from widgets
 
 
 class BuckletApp(App):
@@ -48,7 +80,7 @@ class BuckletApp(App):
     DataTable { height: 1fr; }
 
     DetailScreen, PromptScreen, ProfileScreen, AddProfileScreen, UploadScreen,
-    ConfirmScreen {
+    ConfirmScreen, SettingsScreen {
         align: center middle;
     }
     #dialog {
@@ -67,14 +99,17 @@ class BuckletApp(App):
     """
 
     BINDINGS = [
+        # Object-specific actions (greyed out when nothing is listed; see
+        # check_action). The footer draws a divider after this group.
         Binding("i", "detail", "Info"),
         Binding("t", "thaw('Bulk')", "Thaw"),
         Binding("T", "thaw('Standard')", "Thaw+", show=False),
         Binding("g", "download", "Get"),
-        Binding("u", "upload", "Upload"),
-        # Only shown/active when the app was launched with --allow-deletion;
-        # see check_action.
+        # Only shown/active when launched with --allow-deletion; see check_action.
         Binding("d", "delete", "Delete"),
+        # Bucket-/app-wide actions.
+        Binding("u", "upload", "Upload"),
+        Binding("s", "settings", "Settings"),
         Binding("r", "refresh", "Refresh"),
         Binding("slash", "search", "Search"),
         Binding("f", "filter", "Filter"),
@@ -111,7 +146,7 @@ class BuckletApp(App):
         yield Static(id="bar")
         yield DataTable(id="objects", zebra_stripes=True, cursor_type="row")
         yield Static(id="message")
-        yield Footer()
+        yield BuckletFooter()
 
     def on_mount(self):
         table = self.query_one("#objects", DataTable)
@@ -215,8 +250,13 @@ class BuckletApp(App):
                 key=obj.key,
             )
         self._update_bar()
+        # Whether there's anything to act on just changed, so re-evaluate which
+        # object actions the footer shows as enabled (see check_action).
+        self.refresh_bindings()
 
     def _update_bar(self):
+        from rich.text import Text
+
         bar = self.query_one("#bar", Static)
         if self.service is None:
             self.sub_title = "no profile"
@@ -229,15 +269,31 @@ class BuckletApp(App):
             state = self._state_of(obj)
             counts[state] = counts.get(state, 0) + 1
         ready = counts[storage.THAWED] + counts[storage.AVAILABLE]
-        # Only mention errors when there are some, so a healthy bucket stays clean.
-        err = f" · err {counts[storage.ERROR]}" if counts[storage.ERROR] else ""
-        filt = "" if self.state_filter is None else f"  · filter:{self.state_filter}"
-        srch = f"  · /{self.search_term}" if self.search_term else ""
-        bar.update(
-            f"{prof.bucket} [{prof.region or '?'}]   "
-            f"{len(self.objects)} objects · cold {counts[storage.COLD]} · "
-            f"thawing {counts[storage.THAWING]} · ready {ready}{err}{filt}{srch}"
-        )
+
+        # Built as a Text (not a markup string) so bucket names / search terms
+        # can't be misread as console markup. State counts wear their state
+        # colour; an active filter/search is bold so it stands out (it replaces
+        # the old toast — the table above already reflects the change).
+        text = Text(f"{prof.bucket} [{prof.region or '?'}]   ", style="dim")
+        text.append(f"{len(self.objects)} objects · ")
+        text.append(f"cold {counts[storage.COLD]}", style=STATE_STYLE[storage.COLD])
+        text.append(" · ")
+        text.append(f"thawing {counts[storage.THAWING]}", style=STATE_STYLE[storage.THAWING])
+        text.append(" · ")
+        text.append(f"ready {ready}", style=STATE_STYLE[storage.AVAILABLE])
+        if counts[storage.ERROR]:
+            text.append(" · ")
+            text.append(f"err {counts[storage.ERROR]}", style=STATE_STYLE[storage.ERROR])
+        if self.state_filter is not None:
+            text.append("   ")
+            text.append(
+                f"filter:{self.state_filter}",
+                style=f"bold {STATE_STYLE.get(self.state_filter, 'white')}",
+            )
+        if self.search_term:
+            text.append("   ")
+            text.append(f"/{self.search_term}", style="bold cyan")
+        bar.update(text)
 
     def set_message(self, text: str, error: bool = False):
         message = self.query_one("#message", Static)
@@ -278,14 +334,18 @@ class BuckletApp(App):
         return True
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide the delete binding entirely unless launched with --allow-deletion.
+        """Gate the footer keys to the current context.
 
-        Textual treats ``False`` as "drop the binding" (gone from the footer and
-        the key does nothing) and ``None`` as "show it greyed out". We want the
-        former: with no --allow-deletion, deletion shouldn't exist at all.
+        Textual reads the return value as: ``True`` show+enable, ``None`` show
+        but grey out (still no-op), ``False`` drop entirely. So deletion without
+        --allow-deletion returns False (gone), and the object actions return
+        None when nothing is listed (greyed out, since there's nothing to act
+        on) — leaving the bucket-wide keys always available.
         """
         if action == "delete" and not self.allow_deletion:
             return False
+        if action in _OBJECT_ACTIONS and not self.displayed:
+            return None
         return True
 
     @on(DataTable.RowSelected)
@@ -432,30 +492,86 @@ class BuckletApp(App):
         except BuckletError as exc:
             self.call_from_thread(self.set_message, str(exc), True)
             return
-        for i, (local, key) in enumerate(plan, 1):
-            total = max(local.stat().st_size, 1)
-            sent = {"n": 0}
+        if not plan:
+            self.call_from_thread(self.set_message, "nothing to upload")
+            return
 
-            def progress(
-                n: int,
-                sent: dict = sent,
-                key: str = key,
-                i: int = i,
-                total: int = total,
-            ):
-                sent["n"] += n
-                self.call_from_thread(
-                    self.set_message,
-                    f"[{i}/{len(plan)}] uploading {key}… {sent['n'] * 100 // total}%",
-                )
+        # Throttle UI updates to whole-percent / file boundaries: with many
+        # small files the byte callback fires a lot, and each update crosses
+        # threads. upload_many serialises this callback, so the closure state
+        # needs no extra lock.
+        last = {"pct": -1, "done": -1}
 
-            try:
-                service.upload(local, key, storage_class=storage_class, progress=progress)
-            except BuckletError as exc:
-                self.call_from_thread(self.set_message, f"{key}: {exc}", True)
+        def progress(sent: int, total: int, done: int, total_files: int):
+            pct = min(100, sent * 100 // total)
+            if (pct, done) == (last["pct"], last["done"]):
                 return
-        self.call_from_thread(self.set_message, f"uploaded {len(plan)} file(s)")
-        self.call_from_thread(self.reload)
+            last["pct"], last["done"] = pct, done
+            self.call_from_thread(
+                self.set_message, f"uploading {done}/{total_files} files… {pct}%"
+            )
+
+        results = service.upload_many(plan, storage_class=storage_class, progress=progress)
+        failures = [(key, err) for key, err in results if err is not None]
+        # Refresh the listing here (not via reload) so the result message we set
+        # next isn't immediately wiped by reload's own "loading…"/clear cycle.
+        try:
+            self.call_from_thread(self._populate, service.list_objects())
+        except BuckletError:
+            pass  # the upload outcome below matters more than refreshing the view
+        if failures:
+            key, err = failures[0]
+            extra = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
+            self.call_from_thread(
+                self.set_message,
+                f"{len(failures)}/{len(results)} failed — {key}: {err}{extra}",
+                True,
+            )
+        else:
+            self.call_from_thread(self.set_message, f"uploaded {len(results)} file(s)")
+
+    def action_settings(self):
+        if not self._require_service():
+            return
+        self.push_screen(SettingsScreen(self.service.profile), self._on_settings)
+
+    def _on_settings(self, values: dict | None):
+        if values is None:
+            return
+        from .. import s3
+
+        profile = self.service.profile
+        for key, value in values.items():
+            setattr(profile, key, value)
+        # Persist when the profile is saved (a raw-bucket profile isn't); either
+        # way the change applies to this session.
+        if self.config.has(profile.name):
+            stored = self.config.stored(profile.name)
+            for key, value in values.items():
+                if value is None:
+                    stored.pop(key, None)  # cleared field == back to default
+                else:
+                    stored[key] = value
+            try:
+                self.config.save()
+            except OSError as exc:
+                # The in-memory profile still reflects the change; just tell the
+                # user it didn't reach disk rather than crash the callback.
+                self.set_message(f"applied, but could not save config: {exc}", True)
+                return
+        # Rebuild the client so the (locally constructed, no-network) pool sizing
+        # reflects the new concurrency. The listing and filters are left as-is.
+        old_client = self.service.client
+        try:
+            self.service = Service(profile, s3.build_client(profile))
+        except BuckletError as exc:
+            self.set_message(str(exc), True)
+            return
+        try:
+            old_client.close()  # release the previous pool's connections
+        except Exception:
+            pass
+        self.set_message("settings updated")
 
     def action_refresh(self):
         if self._require_service():
@@ -473,8 +589,9 @@ class BuckletApp(App):
     def action_filter(self):
         idx = _FILTER_CYCLE.index(self.state_filter)
         self.state_filter = _FILTER_CYCLE[(idx + 1) % len(_FILTER_CYCLE)]
+        # No toast: the table and the colour-coded filter chip in the bar already
+        # show the change, and a toast on every cycle was just noise.
         self.refresh_view()
-        self.notify(f"filter: {self.state_filter or 'all'}")
 
     def action_switch_profile(self):
         names = self.config.names()

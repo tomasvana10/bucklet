@@ -194,3 +194,101 @@ def test_delete_propagates_access_denied(make_service, monkeypatch):
     monkeypatch.setattr(s3, "delete_object", denied)
     with pytest.raises(BuckletError, match="access denied"):
         svc.delete("anything")
+
+
+def test_upload_many_uploads_all(make_service, tmp_path):
+    svc = make_service()
+    plan = []
+    for name in ("a.txt", "b.txt", "c.txt"):
+        f = tmp_path / name
+        f.write_text(name * 10)
+        plan.append((f, name))
+
+    results = svc.upload_many(plan, storage_class="standard")
+    assert {key for key, err in results} == {"a.txt", "b.txt", "c.txt"}
+    assert all(err is None for _key, err in results)
+    assert [o.key for o in svc.list_objects()] == ["a.txt", "b.txt", "c.txt"]
+
+
+def test_upload_many_reports_aggregate_progress(make_service, tmp_path):
+    svc = make_service()
+    plan = []
+    for name in ("a", "b"):
+        f = tmp_path / name
+        f.write_text("x" * 100)
+        plan.append((f, name))
+
+    seen = []
+    svc.upload_many(plan, storage_class="standard", progress=lambda *a: seen.append(a))
+    assert seen, "progress should be reported"
+    last_sent, total, done, total_files = seen[-1]
+    assert done == total_files == 2
+    assert last_sent == total  # all bytes accounted for at the end
+
+
+def test_upload_many_partial_failure_does_not_abort(make_service, tmp_path, monkeypatch):
+    svc = make_service()
+    plan = []
+    for name in ("ok1", "bad", "ok2"):
+        f = tmp_path / name
+        f.write_text("data")
+        plan.append((f, name))
+
+    from bucklet import s3
+
+    real = s3.upload_file
+
+    def flaky(client, bucket, local, key, sc, **kw):
+        if key == "bad":
+            raise BuckletError("denied")
+        return real(client, bucket, local, key, sc, **kw)
+
+    monkeypatch.setattr(s3, "upload_file", flaky)
+    results = dict(svc.upload_many(plan, storage_class="standard"))
+    assert results["ok1"] is None and results["ok2"] is None
+    assert isinstance(results["bad"], BuckletError)
+    # the two good files still made it despite the middle failure
+    assert set(o.key for o in svc.list_objects()) == {"ok1", "ok2"}
+
+
+def test_upload_many_empty_plan(make_service):
+    assert make_service().upload_many([]) == []
+
+
+def test_upload_many_survives_unexpected_error(make_service, tmp_path, monkeypatch):
+    """A non-BuckletError on one file must not crash the whole batch."""
+    svc = make_service()
+    plan = []
+    for name in ("ok1", "boom", "ok2"):
+        f = tmp_path / name
+        f.write_text("data")
+        plan.append((f, name))
+
+    from bucklet import s3
+
+    real = s3.upload_file
+
+    def explode(client, bucket, local, key, sc, **kw):
+        if key == "boom":
+            raise RuntimeError("kaboom")  # not a BuckletError
+        return real(client, bucket, local, key, sc, **kw)
+
+    monkeypatch.setattr(s3, "upload_file", explode)
+    results = dict(svc.upload_many(plan, storage_class="standard"))
+    assert results["ok1"] is None and results["ok2"] is None
+    assert isinstance(results["boom"], BuckletError)  # wrapped, not raised
+    assert set(o.key for o in svc.list_objects()) == {"ok1", "ok2"}
+
+
+def test_upload_many_survives_buggy_progress_callback(make_service, tmp_path):
+    """A progress callback that raises must not fail the uploads."""
+    svc = make_service()
+    f = tmp_path / "a"
+    f.write_text("x" * 50)
+
+    def bad_progress(*_a):
+        raise ValueError("bad callback")
+
+    results = svc.upload_many([(f, "a")], storage_class="standard", progress=bad_progress)
+    assert results == [("a", None)]  # uploaded fine despite the callback
+    assert [o.key for o in svc.list_objects()] == ["a"]

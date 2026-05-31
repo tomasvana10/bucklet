@@ -1,8 +1,10 @@
 """Tests for profile config: CRUD, resolution, materialization."""
 
+import json
+
 import pytest
 
-from bucklet.config import Config
+from bucklet.config import CONFIG_VERSION, Config
 from bucklet.errors import BuckletError
 from bucklet.models import Profile
 
@@ -108,3 +110,78 @@ def test_save_permissions(config_dir):
     cfg.save()
     mode = stat.S_IMODE(os.stat(config_dir / "config.json").st_mode)
     assert mode == 0o600
+
+
+def test_save_writes_version(config_dir):
+    cfg = Config.load()
+    cfg.add(Profile(name="p", bucket="b"))
+    cfg.save()
+    data = json.loads((config_dir / "config.json").read_text())
+    assert data["version"] == CONFIG_VERSION
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_legacy_config_is_migrated_and_persisted(config_dir):
+    # a pre-versioning file (no "version") is the original layout == v1
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "config.json"
+    path.write_text(json.dumps({"default": "old", "profiles": {"old": {"bucket": "b"}}}))
+
+    cfg = Config.load()
+    assert cfg.get("old").bucket == "b"
+    # the upgrade is stamped and written back to disk
+    on_disk = json.loads(path.read_text())
+    assert on_disk["version"] == CONFIG_VERSION
+    assert on_disk["profiles"]["old"]["bucket"] == "b"
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_config_from_newer_bucklet_is_refused(config_dir):
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "config.json"
+    path.write_text(json.dumps({"version": CONFIG_VERSION + 1, "profiles": {}}))
+    with pytest.raises(BuckletError, match="newer"):
+        Config.load()
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_malformed_version_is_normalized_and_persisted(config_dir):
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "config.json"
+    # a hand-corrupted version (0) should be normalised to a valid one and saved
+    path.write_text(json.dumps({"version": 0, "profiles": {"p": {"bucket": "b"}}}))
+    Config.load()
+    assert json.loads(path.read_text())["version"] == CONFIG_VERSION
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_legacy_config_without_tuning_uses_defaults():
+    # a v1 profile predating the tuning knobs still resolves to sane defaults
+    cfg = Config.load()
+    cfg.add(Profile(name="p", bucket="b"))
+    cfg.save()
+    prof = Config.load().get("p")
+    assert prof.upload_concurrency is None  # not stored
+    assert prof.tuning.upload_concurrency > 0  # but resolves to a default
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_tuning_fields_round_trip():
+    cfg = Config.load()
+    cfg.add(
+        Profile(
+            name="p",
+            bucket="b",
+            multipart_chunksize=64 * 1024 * 1024,
+            upload_concurrency=8,
+        )
+    )
+    cfg.save()
+
+    again = Config.load()
+    prof = again.get("p")
+    assert prof.multipart_chunksize == 64 * 1024 * 1024
+    assert prof.upload_concurrency == 8
+    # unset knobs stay None (so they resolve to the default)
+    assert prof.multipart_threshold is None
+    assert prof.tuning.upload_concurrency == 8

@@ -226,3 +226,28 @@ def test_delete_object_network_error_raises_buckleterror():
 
     with pytest.raises(BuckletError):
         s3.delete_object(FakeClient(), "the-bucket", "k")
+
+
+def test_upload_file_network_error_raises_buckleterror(tmp_path):
+    from botocore.exceptions import EndpointConnectionError
+
+    class FakeClient:
+        def upload_file(self, *args, **kwargs):
+            raise EndpointConnectionError(endpoint_url="https://s3.example")
+
+    src = tmp_path / "f"
+    src.write_text("x")
+    with pytest.raises(BuckletError):
+        s3.upload_file(FakeClient(), "the-bucket", src, "k", "STANDARD")
+
+
+def test_build_client_pool_scales_with_tuning():
+    def prof(**kw):
+        return Profile(name="t", bucket="b", region="us-east-1", **kw)
+
+    def pool(p):
+        return s3.build_client(p).meta.config.max_pool_connections
+
+    assert pool(prof()) == 40  # default 4 x 10
+    assert pool(prof(upload_concurrency=6, max_concurrency=4)) == 24  # 6 x 4
+    assert pool(prof(upload_concurrency=1000, max_concurrency=1000)) == 128  # capped

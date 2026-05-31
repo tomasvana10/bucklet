@@ -18,11 +18,22 @@ from bucklet.models import ObjectInfo, ObjectStatus, Profile
 from bucklet.tui.app import BuckletApp
 
 
+class _FakeClient:
+    """Stands in for a boto3 client; only needs to be closeable."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 class FakeService:
     def __init__(self):
         self.profile = Profile(
             name="t", bucket="b", region="us-east-1", storage_class="DEEP_ARCHIVE"
         )
+        self.client = _FakeClient()
         self.objects = [
             ObjectInfo("cold.bin", 100, None, "DEEP_ARCHIVE"),
             ObjectInfo("doc.txt", 50, None, "STANDARD"),
@@ -33,6 +44,10 @@ class FakeService:
         self.restored: list[tuple[str, str]] = []
         self.downloaded: list[str] = []
         self.deleted: list[str] = []
+        self.uploaded: list[str] = []
+        # The (local, key) plan plan_upload hands back, and per-key upload errors.
+        self.plan: list[tuple[Path, str]] = []
+        self.upload_errors: dict[str, BuckletError] = {}
         # When set, the matching operation raises BuckletError to simulate a
         # denied/broken bucket (e.g. an archive-only key that cannot delete).
         self.list_error: str | None = None
@@ -61,6 +76,24 @@ class FakeService:
         # Mirror S3: a successful delete is reflected in subsequent listings.
         self.objects = [o for o in self.objects if o.key != key]
         return f"deleted {key}"
+
+    def plan_upload(self, paths, prefix: str = ""):
+        return list(self.plan)
+
+    def upload_many(self, plan, *, storage_class=None, progress=None):
+        plan = list(plan)
+        total = len(plan)
+        results = []
+        for i, (_local, key) in enumerate(plan, 1):
+            if progress is not None:
+                progress(i, total or 1, i, total)
+            err = self.upload_errors.get(key)
+            if err is None:
+                self.uploaded.append(key)
+                # mirror S3: a successful upload shows up in the next listing
+                self.objects.append(ObjectInfo(key, 1, None, "STANDARD"))
+            results.append((key, err))
+        return results
 
 
 def _app(tmp_path: Path, fake: FakeService, *, allow_deletion: bool = False):
@@ -405,3 +438,152 @@ async def test_actions_safe_on_empty_listing(tmp_path):
         assert fake.restored == []
         # no modal (info/confirm) was pushed on an empty listing
         assert len(app.screen_stack) == 1
+
+
+# --- footer: divider + greying object actions -------------------------------
+
+
+async def test_footer_has_divider(tmp_path):
+    from textual.widgets import Static
+
+    from bucklet.tui.app import BuckletFooter
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        footer = app.query_one(BuckletFooter)
+        dividers = [w for w in footer.query(Static) if "footer-divider" in w.classes]
+        assert len(dividers) == 1
+
+
+async def test_object_actions_greyed_when_empty(tmp_path):
+    # with objects listed, object actions are live
+    app = _app(tmp_path, FakeService())
+    async with app.run_test():
+        await app.workers.wait_for_complete()
+        for action in ("detail", "thaw", "download"):
+            assert app.check_action(action, ()) is True
+
+    # with nothing listed, they grey out (None) rather than vanish (False)
+    fake = FakeService()
+    fake.list_error = "boom"
+    app2 = _app(tmp_path, fake)
+    async with app2.run_test():
+        await app2.workers.wait_for_complete()
+        assert app2.displayed == []
+        for action in ("detail", "thaw", "download"):
+            assert app2.check_action(action, ()) is None
+        # bucket-wide actions stay available
+        assert app2.check_action("upload", ()) is True
+        assert app2.check_action("settings", ()) is True
+
+
+# --- filter no longer toasts ------------------------------------------------
+
+
+async def test_filter_does_not_toast(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        calls = []
+        app.notify = lambda *a, **k: calls.append((a, k))  # type: ignore[method-assign]
+        await pilot.press("f")
+        await pilot.pause()
+        assert app.state_filter == storage.COLD  # still cycles
+        assert calls == []  # but no toast
+
+
+# --- per-profile settings ---------------------------------------------------
+
+
+def _saved_config(tmp_path):
+    cfg = Config(tmp_path / "config.json")
+    cfg.add(Profile(name="t", bucket="b", region="us-east-1", storage_class="DEEP_ARCHIVE"))
+    cfg.save()
+    return cfg
+
+
+async def test_settings_applies_and_persists(tmp_path):
+    from textual.widgets import Button, Input
+
+    cfg = _saved_config(tmp_path)
+    fake = FakeService()  # fake.profile.name == "t", matching the saved profile
+    app = BuckletApp(config=cfg, service=fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("s")
+        await pilot.pause()
+        old_client = app.service.client
+        screen = app.screen
+        screen.query_one("#tune-multipart-chunksize", Input).value = "64MB"
+        screen.query_one("#tune-upload-concurrency", Input).value = "8"
+        screen.query_one("#ok", Button).press()  # robust vs. a scrolled-off button
+        await pilot.pause()
+        # applied to the live profile and written to the saved config
+        assert app.service.profile.multipart_chunksize == 64 * 1024**2
+        reloaded = Config.load(tmp_path).get("t")
+        assert reloaded.multipart_chunksize == 64 * 1024**2
+        assert reloaded.upload_concurrency == 8
+        # the client was rebuilt (new pool) and the old one released
+        assert old_client.closed is True
+        assert app.service.client is not old_client
+
+
+async def test_settings_blank_field_resets(tmp_path):
+    from textual.widgets import Button, Input
+
+    cfg = Config(tmp_path / "config.json")
+    cfg.add(Profile(name="t", bucket="b", region="us-east-1", multipart_chunksize=64 * 1024**2))
+    cfg.save()
+    fake = FakeService()
+    # the open profile reflects the stored value, as Service.open would materialize it
+    fake.profile.multipart_chunksize = 64 * 1024**2
+    app = BuckletApp(config=cfg, service=fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("s")
+        await pilot.pause()
+        field = app.screen.query_one("#tune-multipart-chunksize", Input)
+        assert field.value == "64.0MB"  # prefilled with the current value
+        field.value = ""  # clear it -> reset to default
+        app.screen.query_one("#ok", Button).press()
+        await pilot.pause()
+        reloaded = Config.load(tmp_path).get("t")
+        assert reloaded.multipart_chunksize is None
+
+
+# --- upload goes through upload_many ----------------------------------------
+
+
+async def test_upload_uses_upload_many(tmp_path):
+    fake = FakeService()
+    fake.plan = [(Path("a"), "a"), (Path("b"), "b")]
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        app._upload_worker("ignored", "STANDARD", "")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.uploaded == ["a", "b"]
+        # the in-worker re-list refreshed the view with the new objects
+        keys = [o.key for o in app.objects]
+        assert "a" in keys and "b" in keys
+
+
+async def test_upload_reports_partial_failure(tmp_path):
+    from textual.widgets import Static
+
+    fake = FakeService()
+    fake.plan = [(Path("a"), "a"), (Path("b"), "b")]
+    fake.upload_errors = {"b": BuckletError("denied")}
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        app._upload_worker("ignored", "STANDARD", "")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.uploaded == ["a"]  # the good one still uploaded
+        message = app.query_one("#message", Static)
+        assert "failed" in str(message.render())
