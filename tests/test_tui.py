@@ -111,8 +111,7 @@ def _messages(app):
 
 def _has_message(app, substring: str, severity: str | None = None) -> bool:
     return any(
-        substring in text and (severity is None or sev == severity)
-        for text, sev in _messages(app)
+        substring in text and (severity is None or sev == severity) for text, sev in _messages(app)
     )
 
 

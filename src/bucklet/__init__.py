@@ -1,4 +1,4 @@
-""""Manage S3 objects in any storage class."
+""" "Manage S3 objects in any storage class."
 
 The CLI and the Textual TUI are thin frontends over one UI-agnostic core
 (:mod:`bucklet.service`). The modules underneath it are:

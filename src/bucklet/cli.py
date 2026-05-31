@@ -77,9 +77,7 @@ def build_parser():
     class_help = f"storage class (e.g. {class_list})"
 
     p = argparse.ArgumentParser(
-        prog=PROG,
-        parents=[common],
-        description="Manage S3 objects in any storage class."
+        prog=PROG, parents=[common], description="Manage S3 objects in any storage class."
     )
     # TUI-only guard: with no subcommand bucklet opens the TUI, and this flag is
     # what unlocks object deletion there. It has no effect on the subcommands.
