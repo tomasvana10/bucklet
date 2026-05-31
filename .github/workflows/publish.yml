@@ -1,8 +1,5 @@
 name: Publish to PyPI
 
-# Publishes to PyPI when a GitHub release is published. Uses trusted publishing
-# (OIDC), so there is no API token to manage: configure bucklet as a trusted
-# publisher on PyPI and add a "pypi" environment to this repo.
 on:
   release:
     types: [published]
