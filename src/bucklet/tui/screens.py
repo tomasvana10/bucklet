@@ -43,6 +43,46 @@ class DetailScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """Yes/no confirmation for a destructive action.
+
+    Returns ``True`` only on an explicit confirm; esc, ``n`` and Cancel all
+    return ``False``. Focus starts on Cancel so a stray Enter never deletes.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("n", "cancel", "No"),
+        Binding("y", "confirm", "Yes"),
+    ]
+
+    def __init__(self, title: str, lines: list[str], confirm_label: str = "Delete"):
+        super().__init__()
+        self._title = title
+        self._lines = lines
+        self._confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self._title, classes="dialog-title")
+            yield Static("\n".join(self._lines))
+            yield Label("y to confirm · n / esc to cancel", classes="hint")
+            with Horizontal(classes="buttons"):
+                yield Button(self._confirm_label, id="ok", variant="error")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self):
+        self.query_one("#cancel", Button).focus()
+
+    @on(Button.Pressed, "#ok")
+    def action_confirm(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self):
+        self.dismiss(False)
+
+
 class PromptScreen(ModalScreen[str | None]):
     """One-line text prompt (used for search)."""
 

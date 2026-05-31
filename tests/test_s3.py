@@ -154,3 +154,75 @@ def test_download_invalid_object_state_raises(tmp_path):
 
     with pytest.raises(BuckletError, match="not restored yet"):
         s3.download_file(FakeClient(), "the-bucket", "k", tmp_path / "out" / "f")
+
+
+def test_delete_object_roundtrip(s3_client, tmp_path):
+    s3_client.create_bucket(Bucket="the-bucket")
+    client = s3.build_client(
+        Profile(
+            name="t",
+            bucket="the-bucket",
+            region="us-east-1",
+            access_key_id="testing",
+            secret_access_key="testing",
+        )
+    )
+    src = tmp_path / "f"
+    src.write_text("x")
+    s3.upload_file(client, "the-bucket", src, "k", "STANDARD")
+    assert [o.key for o in s3.list_objects(client, "the-bucket")] == ["k"]
+
+    s3.delete_object(client, "the-bucket", "k")
+    assert list(s3.list_objects(client, "the-bucket")) == []
+
+
+def test_delete_object_access_denied_raises():
+    class FakeClient:
+        def delete_object(self, *args, **kwargs):
+            raise _client_error("AccessDenied")
+
+    # An archive-only key that lacks s3:DeleteObject must surface as a clean
+    # BuckletError, not a raw botocore traceback.
+    with pytest.raises(BuckletError, match="access denied"):
+        s3.delete_object(FakeClient(), "the-bucket", "k")
+
+
+def test_head_status_survives_network_error():
+    """A non-ClientError botocore failure (e.g. a timeout while polling a
+    thawing object) must degrade to an ERROR state, never raise."""
+    from botocore.exceptions import EndpointConnectionError
+
+    class FakeClient:
+        def head_object(self, *args, **kwargs):
+            raise EndpointConnectionError(endpoint_url="https://s3.example")
+
+    status = s3.head_status(FakeClient(), "the-bucket", "k")
+    assert status.state == storage.ERROR
+    assert status.error  # carries a message rather than crashing
+
+
+def test_list_objects_network_error_raises_buckleterror():
+    from botocore.exceptions import EndpointConnectionError
+
+    class FakePaginator:
+        def paginate(self, **_kwargs):
+            # the network call happens as the pages are fetched
+            raise EndpointConnectionError(endpoint_url="https://s3.example")
+
+    class FakeClient:
+        def get_paginator(self, _name):
+            return FakePaginator()
+
+    with pytest.raises(BuckletError):
+        list(s3.list_objects(FakeClient(), "the-bucket"))
+
+
+def test_delete_object_network_error_raises_buckleterror():
+    from botocore.exceptions import ConnectTimeoutError
+
+    class FakeClient:
+        def delete_object(self, *args, **kwargs):
+            raise ConnectTimeoutError(endpoint_url="https://s3.example")
+
+    with pytest.raises(BuckletError):
+        s3.delete_object(FakeClient(), "the-bucket", "k")

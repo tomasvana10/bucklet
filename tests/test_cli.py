@@ -219,12 +219,38 @@ def test_no_subcommand_launches_tui(config_dir, monkeypatch):
 
     called = {}
 
-    def fake_run_tui(_config, profile_arg=None):
+    def fake_run_tui(_config, profile_arg=None, *, allow_deletion=False):
         called["profile"] = profile_arg
+        called["allow_deletion"] = allow_deletion
 
     monkeypatch.setattr(app_mod, "run_tui", fake_run_tui)
     assert main([]) == 0
-    assert called == {"profile": None}
+    # deletion is off unless explicitly requested
+    assert called == {"profile": None, "allow_deletion": False}
+
+
+def test_allow_deletion_flag_reaches_tui(config_dir, monkeypatch):
+    from bucklet.tui import app as app_mod
+
+    called = {}
+
+    def fake_run_tui(_config, profile_arg=None, *, allow_deletion=False):
+        called["allow_deletion"] = allow_deletion
+
+    monkeypatch.setattr(app_mod, "run_tui", fake_run_tui)
+    assert main(["--allow-deletion"]) == 0
+    assert called["allow_deletion"] is True
+
+
+def test_no_delete_subcommand_exists(config_dir, capsys):
+    # Deletion is intentionally TUI-only: there must be no `delete`/`rm` object
+    # subcommand on the CLI. argparse exits 2 on an unknown subcommand.
+    import pytest
+
+    for bad in ("delete", "rm"):
+        with pytest.raises(SystemExit) as exc:
+            main([bad, "some-key"])
+        assert exc.value.code == 2
 
 
 def test_profile_flag_after_profile_subcommand(config_dir, capsys):

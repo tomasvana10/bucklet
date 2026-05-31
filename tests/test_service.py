@@ -171,3 +171,26 @@ def test_restore_error_raises(make_service, monkeypatch):
     _force_status(svc, ObjectStatus("k", storage.ERROR, error="boom"), monkeypatch)
     with pytest.raises(BuckletError, match="boom"):
         svc.restore("k")
+
+
+def test_delete_removes_object(make_service, tmp_path):
+    svc = make_service()
+    f = tmp_path / "f"
+    f.write_text("x")
+    svc.upload(f, "f", storage_class="standard")
+    assert [o.key for o in svc.list_objects()] == ["f"]
+    message = svc.delete("f")
+    assert "deleted" in message and "f" in message
+    assert svc.list_objects() == []
+
+
+def test_delete_propagates_access_denied(make_service, monkeypatch):
+    svc = make_service()
+    from bucklet import s3
+
+    def denied(client, bucket, key):
+        raise BuckletError("access denied (check the IAM policy and keys)")
+
+    monkeypatch.setattr(s3, "delete_object", denied)
+    with pytest.raises(BuckletError, match="access denied"):
+        svc.delete("anything")

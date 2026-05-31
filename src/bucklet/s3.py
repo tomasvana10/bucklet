@@ -79,7 +79,7 @@ def validate(client: BaseClient, bucket: str):
 
 def list_objects(client: BaseClient, bucket: str, prefix: str = ""):
     """Yield every object under ``prefix`` (paginated)."""
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import BotoCoreError, ClientError
 
     paginator = client.get_paginator("list_objects_v2")
     try:
@@ -93,16 +93,27 @@ def list_objects(client: BaseClient, bucket: str, prefix: str = ""):
                 )
     except ClientError as exc:
         raise BuckletError(_client_error_message(exc)) from exc
+    except BotoCoreError as exc:
+        # Connection/timeout/credential failures (the non-ClientError half of
+        # the botocore zoo) must surface as a clean error, not a raw traceback.
+        raise BuckletError(str(exc) or "could not list objects") from exc
 
 
 def head_status(client: BaseClient, bucket: str, key: str):
-    """HEAD one object and return its resolved :class:`ObjectStatus`."""
-    from botocore.exceptions import ClientError
+    """HEAD one object and return its resolved :class:`ObjectStatus`.
+
+    This never raises: a failed HEAD (denied, missing, or a network/credential
+    error) comes back as an ``ERROR`` state. Callers poll it from worker threads,
+    so a transient failure must degrade to a marked row, not a crash.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
 
     try:
         resp = client.head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
         return ObjectStatus(key=key, state=storage.ERROR, error=_client_error_message(exc))
+    except BotoCoreError as exc:
+        return ObjectStatus(key=key, state=storage.ERROR, error=str(exc) or "status unavailable")
     sc = resp.get("StorageClass", "STANDARD")
     restore = resp.get("Restore")
     return ObjectStatus(
@@ -131,6 +142,23 @@ def restore_object(client: BaseClient, bucket: str, key: str, tier: str = "Bulk"
         if code == "RestoreAlreadyInProgress":
             return "restore already in progress"
         raise BuckletError(_client_error_message(exc)) from exc
+
+
+def delete_object(client: BaseClient, bucket: str, key: str):
+    """Delete one object. Raises :class:`BuckletError` on failure.
+
+    S3 deletion is idempotent (deleting a missing key still succeeds), so the
+    only failures here are real ones: most often ``AccessDenied`` when the
+    credentials lack ``s3:DeleteObject`` (common for archive-only keys).
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        client.delete_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        raise BuckletError(_client_error_message(exc)) from exc
+    except BotoCoreError as exc:
+        raise BuckletError(str(exc) or "could not delete object") from exc
 
 
 def download_file(

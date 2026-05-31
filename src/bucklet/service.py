@@ -79,6 +79,17 @@ class Service:
         s3.download_file(self.client, self.bucket, key, dest, callback=progress)
         return dest
 
+    def delete(self, key: str):
+        """Permanently delete one object.
+
+        Raises :class:`~bucklet.errors.BuckletError` if the object cannot be
+        deleted (e.g. the credentials lack ``s3:DeleteObject``). Deletion is
+        intentionally not exposed by the CLI; only the TUI offers it, and only
+        when launched with ``--allow-deletion``.
+        """
+        s3.delete_object(self.client, self.bucket, key)
+        return f"deleted {key}"
+
     def resolve_storage_class(self, storage_class: str | None):
         """The class to upload with: an explicit override or the profile default."""
         if storage_class:

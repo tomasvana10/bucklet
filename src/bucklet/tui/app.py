@@ -25,6 +25,7 @@ from ..models import ObjectInfo, ObjectStatus, Profile
 from ..service import Service
 from .screens import (
     AddProfileScreen,
+    ConfirmScreen,
     DetailScreen,
     ProfileScreen,
     PromptScreen,
@@ -46,7 +47,8 @@ class BuckletApp(App):
     #message.error { color: $error; text-style: bold; }
     DataTable { height: 1fr; }
 
-    DetailScreen, PromptScreen, ProfileScreen, AddProfileScreen, UploadScreen {
+    DetailScreen, PromptScreen, ProfileScreen, AddProfileScreen, UploadScreen,
+    ConfirmScreen {
         align: center middle;
     }
     #dialog {
@@ -70,6 +72,9 @@ class BuckletApp(App):
         Binding("T", "thaw('Standard')", "Thaw+", show=False),
         Binding("g", "download", "Get"),
         Binding("u", "upload", "Upload"),
+        # Only shown/active when the app was launched with --allow-deletion;
+        # see check_action.
+        Binding("d", "delete", "Delete"),
         Binding("r", "refresh", "Refresh"),
         Binding("slash", "search", "Search"),
         Binding("f", "filter", "Filter"),
@@ -87,10 +92,12 @@ class BuckletApp(App):
         *,
         initial_profile: Profile | None = None,
         error: str = "",
+        allow_deletion: bool = False,
     ):
         super().__init__()
         self.config = config
         self.service = service
+        self.allow_deletion = allow_deletion
         self._initial_profile = initial_profile
         self._initial_error = error
         self.objects: list[ObjectInfo] = []
@@ -141,6 +148,10 @@ class BuckletApp(App):
         try:
             objects = service.list_objects()
         except BuckletError as exc:
+            # The listing failed (no permission, bad region, network). Clear any
+            # rows left over from a previous profile so we never show stale data,
+            # and surface the error. The user can still switch/add a profile.
+            self.call_from_thread(self._populate, [])
             self.call_from_thread(self.set_message, f"list error: {exc}", True)
             return
         if worker.is_cancelled:
@@ -213,17 +224,19 @@ class BuckletApp(App):
             return
         prof = self.service.profile
         self.sub_title = f"{prof.name} · {prof.bucket}"
-        counts = {storage.COLD: 0, storage.THAWING: 0, storage.THAWED: 0, storage.AVAILABLE: 0}
+        counts = {state: 0 for state in storage.STATES}
         for obj in self.objects:
             state = self._state_of(obj)
             counts[state] = counts.get(state, 0) + 1
         ready = counts[storage.THAWED] + counts[storage.AVAILABLE]
+        # Only mention errors when there are some, so a healthy bucket stays clean.
+        err = f" · err {counts[storage.ERROR]}" if counts[storage.ERROR] else ""
         filt = "" if self.state_filter is None else f"  · filter:{self.state_filter}"
         srch = f"  · /{self.search_term}" if self.search_term else ""
         bar.update(
             f"{prof.bucket} [{prof.region or '?'}]   "
             f"{len(self.objects)} objects · cold {counts[storage.COLD]} · "
-            f"thawing {counts[storage.THAWING]} · ready {ready}{filt}{srch}"
+            f"thawing {counts[storage.THAWING]} · ready {ready}{err}{filt}{srch}"
         )
 
     def set_message(self, text: str, error: bool = False):
@@ -261,6 +274,17 @@ class BuckletApp(App):
     def _require_service(self):
         if self.service is None:
             self.notify("open a profile first (a / p)", severity="warning")
+            return False
+        return True
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide the delete binding entirely unless launched with --allow-deletion.
+
+        Textual treats ``False`` as "drop the binding" (gone from the footer and
+        the key does nothing) and ``None`` as "show it greyed out". We want the
+        former: with no --allow-deletion, deletion shouldn't exist at all.
+        """
+        if action == "delete" and not self.allow_deletion:
             return False
         return True
 
@@ -347,6 +371,47 @@ class BuckletApp(App):
             self.call_from_thread(self.set_message, f"{key}: {exc}", True)
             return
         self.call_from_thread(self.set_message, f"{key}: downloaded -> {dest}")
+
+    def action_delete(self):
+        # check_action gates this off the footer, but guard anyway: a stray key
+        # press must never delete in a session that did not opt in.
+        if not self.allow_deletion or not self._require_service():
+            return
+        obj = self._selected()
+        if obj is None:
+            return
+        lines = [
+            f"key  : {obj.key}",
+            f"size : {human(obj.size)}",
+            "",
+            "This permanently deletes the object from the bucket.",
+        ]
+        self.push_screen(
+            ConfirmScreen(f"Delete · {obj.key}", lines),
+            lambda ok, key=obj.key: self._delete_worker(key) if ok else None,
+        )
+
+    @work(thread=True, group="op")
+    def _delete_worker(self, key: str):
+        service = self.service
+        if service is None:
+            return
+        self.call_from_thread(self.set_message, f"deleting {key}…")
+        try:
+            message = service.delete(key)
+        except BuckletError as exc:
+            # A failed delete (commonly access denied on archive-only keys) must
+            # leave the object exactly where it was, both on S3 and on screen.
+            self.call_from_thread(self.set_message, f"{key}: {exc}", True)
+            return
+        self.call_from_thread(self._remove_object, key)
+        self.call_from_thread(self.set_message, message)
+
+    def _remove_object(self, key: str):
+        """Drop a deleted object from the view without re-listing the bucket."""
+        self.objects = [o for o in self.objects if o.key != key]
+        self.statuses.pop(key, None)
+        self.refresh_view()
 
     def action_upload(self):
         if not self._require_service():
@@ -455,11 +520,16 @@ class BuckletApp(App):
         self.reload()
 
 
-def run_tui(config: Config, profile_arg: str | None = None):
+def run_tui(config: Config, profile_arg: str | None = None, *, allow_deletion: bool = False):
     """Launch the TUI right away; the profile opens in the background."""
     profile = config.resolve(profile_arg)
     initial_profile = profile if (profile and profile.bucket) else None
     error = ""
     if initial_profile is None and profile_arg:
         error = f"no bucket configured for '{profile_arg}'"
-    BuckletApp(config=config, initial_profile=initial_profile, error=error).run()
+    BuckletApp(
+        config=config,
+        initial_profile=initial_profile,
+        error=error,
+        allow_deletion=allow_deletion,
+    ).run()

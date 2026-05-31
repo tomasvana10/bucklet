@@ -2,8 +2,12 @@
 
 Every subcommand operates on one profile (``--profile NAME``, accepted before or
 after the subcommand; it falls back to the configured default). Running bucklet
-with no subcommand launches the Textual TUI. The CLI is a complete superset of
-the TUI: anything you can do interactively you can script here.
+with no subcommand launches the Textual TUI.
+
+The CLI covers everything the TUI does, with one deliberate exception: object
+deletion. Deleting is destructive and offered only interactively, in the TUI,
+and only when bucklet is launched with ``--allow-deletion``. There is no delete
+subcommand, by design.
 """
 
 # PYTHON_ARGCOMPLETE_OK
@@ -75,8 +79,14 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog=PROG,
         parents=[common],
-        description="Browse, upload, download and restore S3 objects in any storage "
-        "class, from the CLI or the Textual TUI.",
+        description="Manage S3 objects in any storage class."
+    )
+    # TUI-only guard: with no subcommand bucklet opens the TUI, and this flag is
+    # what unlocks object deletion there. It has no effect on the subcommands.
+    p.add_argument(
+        "--allow-deletion",
+        action="store_true",
+        help="allow deleting objects in the TUI (no effect on the subcommands)",
     )
     sub = p.add_subparsers(dest="cmd")
 
@@ -421,7 +431,7 @@ def main(argv: list[str] | None = None):
         if args.cmd is None:
             from .tui.app import run_tui
 
-            run_tui(config, _profile_arg(args))
+            run_tui(config, _profile_arg(args), allow_deletion=args.allow_deletion)
             return 0
         return _HANDLERS[args.cmd](config, args)
     except BuckletError as exc:

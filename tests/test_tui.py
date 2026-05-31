@@ -13,6 +13,7 @@ from textual.widgets import DataTable
 
 from bucklet import storage
 from bucklet.config import Config
+from bucklet.errors import BuckletError
 from bucklet.models import ObjectInfo, ObjectStatus, Profile
 from bucklet.tui.app import BuckletApp
 
@@ -31,8 +32,15 @@ class FakeService:
         }
         self.restored: list[tuple[str, str]] = []
         self.downloaded: list[str] = []
+        self.deleted: list[str] = []
+        # When set, the matching operation raises BuckletError to simulate a
+        # denied/broken bucket (e.g. an archive-only key that cannot delete).
+        self.list_error: str | None = None
+        self.delete_error: str | None = None
 
     def list_objects(self, prefix: str = ""):
+        if self.list_error:
+            raise BuckletError(self.list_error)
         return list(self.objects)
 
     def status(self, key: str):
@@ -46,9 +54,19 @@ class FakeService:
         self.downloaded.append(key)
         return dest
 
+    def delete(self, key: str):
+        if self.delete_error:
+            raise BuckletError(self.delete_error)
+        self.deleted.append(key)
+        # Mirror S3: a successful delete is reflected in subsequent listings.
+        self.objects = [o for o in self.objects if o.key != key]
+        return f"deleted {key}"
 
-def _app(tmp_path: Path, fake: FakeService):
-    return BuckletApp(config=Config(tmp_path / "config.json"), service=fake)
+
+def _app(tmp_path: Path, fake: FakeService, *, allow_deletion: bool = False):
+    return BuckletApp(
+        config=Config(tmp_path / "config.json"), service=fake, allow_deletion=allow_deletion
+    )
 
 
 async def test_table_populates(tmp_path):
@@ -202,3 +220,188 @@ def test_run_tui_without_profile(tmp_path, monkeypatch):
     assert app.service is None
     assert app._initial_profile is None
     assert app._initial_error == ""
+
+
+# --- deletion (gated behind --allow-deletion) -------------------------------
+
+
+async def test_delete_binding_hidden_without_flag(tmp_path):
+    app = _app(tmp_path, FakeService())  # allow_deletion defaults False
+    async with app.run_test():
+        await app.workers.wait_for_complete()
+        # False (not None) is what removes the key from the footer entirely in
+        # Textual; None would only grey it out. We want it gone.
+        assert app.check_action("delete", ()) is False
+        assert "d" not in app.screen.active_bindings  # really absent from the footer
+
+
+async def test_delete_binding_enabled_with_flag(tmp_path):
+    app = _app(tmp_path, FakeService(), allow_deletion=True)
+    async with app.run_test():
+        await app.workers.wait_for_complete()
+        assert app.check_action("delete", ()) is True
+        assert "d" in app.screen.active_bindings
+
+
+async def test_delete_does_nothing_without_flag(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake)  # deletion not allowed
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d")  # cursor on cold.bin
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.deleted == []
+        assert len(app.screen_stack) == 1  # no confirm dialog appeared
+
+
+async def test_delete_confirmed_removes_object(tmp_path):
+    from textual.widgets import Static
+
+    fake = FakeService()
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d")  # cursor on cold.bin -> confirm dialog
+        await pilot.pause()
+        assert len(app.screen_stack) > 1  # confirmation is required
+        await pilot.press("y")  # confirm
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.deleted == ["cold.bin"]
+        assert "cold.bin" not in [o.key for o in app.objects]
+        assert app.query_one(DataTable).row_count == 1
+        # the user is told it worked
+        assert "deleted" in str(app.query_one("#message", Static).render())
+
+
+async def test_delete_then_reload_does_not_resurrect(tmp_path):
+    """A locally-removed row must not reappear when the bucket is re-listed."""
+    fake = FakeService()
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.reload()  # 'r' would do the same; re-lists from the (fake) bucket
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "cold.bin" not in [o.key for o in app.objects]
+        assert app.query_one(DataTable).row_count == 1
+
+
+async def test_delete_cancelled_keeps_object(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("n")  # decline
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.deleted == []
+        assert "cold.bin" in [o.key for o in app.objects]
+        assert app.query_one(DataTable).row_count == 2
+
+
+async def test_delete_cancelled_with_escape_keeps_object(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("escape")  # esc is a distinct cancel path for the dialog
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.deleted == []
+        assert len(app.screen_stack) == 1  # dialog dismissed
+        assert "cold.bin" in [o.key for o in app.objects]
+
+
+async def test_delete_while_filtered_removes_from_view(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("f")  # filter -> COLD; only cold.bin shows
+        await pilot.pause()
+        assert [o.key for o in app.displayed] == ["cold.bin"]
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # gone from both the model and the (still-filtered) view
+        assert "cold.bin" not in [o.key for o in app.objects]
+        assert app.displayed == []
+
+
+async def test_failed_delete_keeps_object_and_warns(tmp_path):
+    from textual.widgets import Static
+
+    fake = FakeService()
+    fake.delete_error = "access denied (check the IAM policy and keys)"
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")  # confirm; the delete then fails
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # the object must stay put when S3 refuses the delete
+        assert "cold.bin" in [o.key for o in app.objects]
+        assert app.query_one(DataTable).row_count == 2
+        message = app.query_one("#message", Static)
+        assert "access denied" in str(message.render())
+        assert message.has_class("error")
+
+
+# --- graceful degradation when the bucket can't be listed -------------------
+
+
+async def test_list_failure_shows_empty_table(tmp_path):
+    from textual.widgets import Static
+
+    fake = FakeService()
+    fake.list_error = "access denied (check the IAM policy and keys)"
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        # no crash; empty table and a surfaced error
+        assert app.query_one(DataTable).row_count == 0
+        assert app.objects == []
+        message = app.query_one("#message", Static)
+        assert "access denied" in str(message.render())
+        assert message.has_class("error")
+
+
+async def test_actions_safe_on_empty_listing(tmp_path):
+    """With nothing listed, the row-actions must no-op rather than crash."""
+    fake = FakeService()
+    fake.list_error = "boom"
+    app = _app(tmp_path, fake, allow_deletion=True)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        for key in ("i", "t", "g", "d", "r"):
+            await pilot.press(key)
+            await pilot.pause()
+        await app.workers.wait_for_complete()
+        assert fake.deleted == []
+        assert fake.downloaded == []
+        assert fake.restored == []
+        # no modal (info/confirm) was pushed on an empty listing
+        assert len(app.screen_stack) == 1
