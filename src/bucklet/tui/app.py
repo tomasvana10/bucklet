@@ -1,9 +1,10 @@
-"""The archy Textual application.
+"""The bucklet Textual application.
 
-The app holds no S3 logic of its own: every action calls a
-:class:`~archy.service.Service` method (the same one the CLI uses) from a
-threaded worker so the UI stays responsive, then reflects the result. Thaw is
-offered only when the selected object's live state actually needs it.
+The app holds no S3 logic of its own. Every action calls a
+:class:`~bucklet.service.Service` method (the same one the CLI uses) from a
+threaded worker so the UI stays responsive, then reflects the result. The
+profile opens in the background too, so the window appears straight away.
+Thaw is offered only when the selected object's live state actually needs it.
 """
 
 from __future__ import annotations
@@ -18,9 +19,9 @@ from textual.worker import get_current_worker
 
 from .. import storage
 from ..config import Config
-from ..errors import ArchyError
+from ..errors import BuckletError
 from ..formatting import STATE_STYLE, fmt_date, human
-from ..models import ObjectInfo, ObjectStatus
+from ..models import ObjectInfo, ObjectStatus, Profile
 from ..service import Service
 from .screens import (
     AddProfileScreen,
@@ -36,8 +37,8 @@ COL_STATE, COL_SIZE, COL_MOD, COL_CLASS, COL_KEY = "state", "size", "mod", "clas
 _FILTER_CYCLE = [None, storage.COLD, storage.THAWING, storage.THAWED, storage.AVAILABLE]
 
 
-class ArchyApp(App):
-    TITLE = "archy"
+class BuckletApp(App):
+    TITLE = "bucklet"
 
     CSS = """
     #bar { height: 1; background: $panel; color: $text; padding: 0 1; }
@@ -49,18 +50,18 @@ class ArchyApp(App):
         align: center middle;
     }
     #dialog {
-        width: 80%;
-        max-width: 92;
+        width: 60;
+        max-width: 90%;
         height: auto;
-        max-height: 90%;
-        padding: 1 2;
-        border: thick $primary;
+        max-height: 80%;
+        padding: 1;
+        border: round $primary;
         background: $surface;
     }
-    .dialog-title { text-style: bold; color: $secondary; margin-bottom: 1; }
-    .hint { color: $text-muted; margin-top: 1; }
-    .buttons { height: auto; margin-top: 1; align-horizontal: right; }
-    .buttons Button { margin-left: 2; }
+    .dialog-title { text-style: bold; color: $secondary; }
+    .hint { color: $text-muted; }
+    .buttons { height: auto; align-horizontal: right; }
+    .buttons Button { margin-left: 1; }
     """
 
     BINDINGS = [
@@ -75,12 +76,22 @@ class ArchyApp(App):
         Binding("p", "switch_profile", "Profile"),
         Binding("a", "add_profile", "Add"),
         Binding("q", "quit", "Quit"),
+        # Ctrl+C quits too, instead of nagging the user to press Ctrl+Q.
+        Binding("ctrl+c", "quit", show=False, priority=True),
     ]
 
-    def __init__(self, config: Config, service: Service | None = None, error: str = ""):
+    def __init__(
+        self,
+        config: Config,
+        service: Service | None = None,
+        *,
+        initial_profile: Profile | None = None,
+        error: str = "",
+    ):
         super().__init__()
         self.config = config
         self.service = service
+        self._initial_profile = initial_profile
         self._initial_error = error
         self.objects: list[ObjectInfo] = []
         self.statuses: dict[str, ObjectStatus] = {}
@@ -88,7 +99,6 @@ class ArchyApp(App):
         self.search_term = ""
         self.state_filter: str | None = None
 
-    # -- layout ----------------------------------------------------------- #
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield Static(id="bar")
@@ -96,7 +106,7 @@ class ArchyApp(App):
         yield Static(id="message")
         yield Footer()
 
-    def on_mount(self) -> None:
+    def on_mount(self):
         table = self.query_one("#objects", DataTable)
         table.add_column("St", key=COL_STATE, width=6)
         table.add_column("Size", key=COL_SIZE, width=10)
@@ -106,14 +116,16 @@ class ArchyApp(App):
         self._update_bar()
         if self.service is not None:
             self.reload()
+        elif self._initial_profile is not None:
+            self.set_message(f"opening {self._initial_profile.name}…")
+            self._open_worker(self._initial_profile)
         elif self._initial_error:
             self.set_message(self._initial_error, error=True)
         else:
-            self.set_message("no profile open — press 'a' to add or 'p' to switch")
+            self.set_message("no profile open. press a to add one or p to switch")
         self.set_interval(20.0, self.poll_thawing)
 
-    # -- data --------------------------------------------------------------#
-    def reload(self) -> None:
+    def reload(self):
         if self.service is None:
             return
         self.statuses = {}
@@ -121,14 +133,14 @@ class ArchyApp(App):
         self._load_worker()
 
     @work(thread=True, exclusive=True, group="load")
-    def _load_worker(self) -> None:
+    def _load_worker(self):
         service = self.service
         if service is None:
             return
         worker = get_current_worker()
         try:
             objects = service.list_objects()
-        except ArchyError as exc:
+        except BuckletError as exc:
             self.call_from_thread(self.set_message, f"list error: {exc}", True)
             return
         if worker.is_cancelled:
@@ -144,11 +156,11 @@ class ArchyApp(App):
         self.call_from_thread(self.refresh_view)
         self.call_from_thread(self.set_message, "")
 
-    def _populate(self, objects: list[ObjectInfo]) -> None:
+    def _populate(self, objects: list[ObjectInfo]):
         self.objects = objects
         self.refresh_view()
 
-    def _apply_status(self, status: ObjectStatus) -> None:
+    def _apply_status(self, status: ObjectStatus):
         self.statuses[status.key] = status
         table = self.query_one("#objects", DataTable)
         try:
@@ -158,12 +170,11 @@ class ArchyApp(App):
             pass  # row not currently visible (filtered out)
         self._update_bar()
 
-    # -- view (filter/search) ---------------------------------------------#
-    def _state_of(self, obj: ObjectInfo) -> str:
+    def _state_of(self, obj: ObjectInfo):
         status = self.statuses.get(obj.key)
         return status.state if status else obj.baseline_state
 
-    def _filtered(self) -> list[ObjectInfo]:
+    def _filtered(self):
         out = self.objects
         if self.search_term:
             term = self.search_term.lower()
@@ -177,23 +188,24 @@ class ArchyApp(App):
 
         return Text(storage.STATE_LABEL.get(state, "?"), style=STATE_STYLE.get(state, ""))
 
-    def refresh_view(self) -> None:
+    def refresh_view(self):
         table = self.query_one("#objects", DataTable)
         table.clear()
         self.displayed = self._filtered()
         for obj in self.displayed:
             state = self._state_of(obj)
+            stored = self.statuses.get(obj.key)
             table.add_row(
                 self._state_cell(state),
                 human(obj.size),
                 fmt_date(obj.last_modified),
-                (self.statuses.get(obj.key).storage_class if obj.key in self.statuses else obj.storage_class),
+                stored.storage_class if stored else obj.storage_class,
                 obj.key,
                 key=obj.key,
             )
         self._update_bar()
 
-    def _update_bar(self) -> None:
+    def _update_bar(self):
         bar = self.query_one("#bar", Static)
         if self.service is None:
             self.sub_title = "no profile"
@@ -214,14 +226,14 @@ class ArchyApp(App):
             f"thawing {counts[storage.THAWING]} · ready {ready}{filt}{srch}"
         )
 
-    def set_message(self, text: str, error: bool = False) -> None:
+    def set_message(self, text: str, error: bool = False):
         message = self.query_one("#message", Static)
         message.set_class(error, "error")
         message.update(text)
         if error and text:
             self.notify(text, severity="error")
 
-    def poll_thawing(self) -> None:
+    def poll_thawing(self):
         if self.service is None:
             return
         thawing = [k for k, s in self.statuses.items() if s.state == storage.THAWING]
@@ -229,7 +241,7 @@ class ArchyApp(App):
             self._restatus_worker(thawing)
 
     @work(thread=True, group="restatus")
-    def _restatus_worker(self, keys: list[str]) -> None:
+    def _restatus_worker(self, keys: list[str]):
         service = self.service
         if service is None:
             return
@@ -237,8 +249,7 @@ class ArchyApp(App):
             status = service.status(key)
             self.call_from_thread(self._apply_status, status)
 
-    # -- selection -------------------------------------------------------- #
-    def _selected(self) -> ObjectInfo | None:
+    def _selected(self):
         if not self.displayed:
             return None
         table = self.query_one("#objects", DataTable)
@@ -247,15 +258,14 @@ class ArchyApp(App):
             return self.displayed[row]
         return None
 
-    def _require_service(self) -> bool:
+    def _require_service(self):
         if self.service is None:
             self.notify("open a profile first (a / p)", severity="warning")
             return False
         return True
 
-    # -- actions ---------------------------------------------------------- #
     @on(DataTable.RowSelected)
-    def action_detail(self) -> None:
+    def action_detail(self):
         obj = self._selected()
         if obj is None:
             return
@@ -272,13 +282,13 @@ class ArchyApp(App):
             lines.append(f"restored : until {status.restore_expiry}")
         if storage.can_thaw(state):
             lines.append("")
-            lines.append("archived — press t (Bulk) or T (Standard) to restore")
+            lines.append("archived. press t (Bulk) or T (Standard) to restore")
         elif storage.can_download(state):
             lines.append("")
             lines.append("press g to download")
         self.push_screen(DetailScreen(f"Object · {obj.key}", lines))
 
-    def action_thaw(self, tier: str) -> None:
+    def action_thaw(self, tier: str):
         if not self._require_service():
             return
         obj = self._selected()
@@ -286,24 +296,24 @@ class ArchyApp(App):
             return
         state = self._state_of(obj)
         if not storage.can_thaw(state):
-            self.notify(f"{obj.key} is {state} — no thaw needed", severity="warning")
+            self.notify(f"{obj.key} is {state}, no thaw needed", severity="warning")
             return
         self._thaw_worker(obj.key, tier)
 
     @work(thread=True, group="op")
-    def _thaw_worker(self, key: str, tier: str) -> None:
+    def _thaw_worker(self, key: str, tier: str):
         service = self.service
         self.call_from_thread(self.set_message, f"requesting {tier} restore: {key}…")
         try:
             message = service.restore(key, tier=tier)
             status = service.status(key)
-        except ArchyError as exc:
-            self.call_from_thread(self.set_message, f"{key} — {exc}", True)
+        except BuckletError as exc:
+            self.call_from_thread(self.set_message, f"{key}: {exc}", True)
             return
         self.call_from_thread(self._apply_status, status)
-        self.call_from_thread(self.set_message, f"{key} — {message}")
+        self.call_from_thread(self.set_message, f"{key}: {message}")
 
-    def action_download(self) -> None:
+    def action_download(self):
         if not self._require_service():
             return
         obj = self._selected()
@@ -312,54 +322,62 @@ class ArchyApp(App):
         state = self._state_of(obj)
         if not storage.can_download(state):
             if storage.can_thaw(state):
-                self.notify(f"{obj.key} is cold — thaw it first (t)", severity="warning")
+                self.notify(f"{obj.key} is cold, thaw it first (t)", severity="warning")
             else:
-                self.notify(f"{obj.key} is {state} — not ready", severity="warning")
+                self.notify(f"{obj.key} is {state}, not ready", severity="warning")
             return
         self._download_worker(obj.key, obj.size)
 
     @work(thread=True, group="op")
-    def _download_worker(self, key: str, size: int) -> None:
+    def _download_worker(self, key: str, size: int):
         service = self.service
         dest = Path.cwd() / key
         total = max(size, 1)
         sent = {"n": 0}
 
-        def progress(n: int) -> None:
+        def progress(n: int):
             sent["n"] += n
-            self.call_from_thread(self.set_message, f"downloading {key}… {sent['n'] * 100 // total}%")
+            self.call_from_thread(
+                self.set_message, f"downloading {key}… {sent['n'] * 100 // total}%"
+            )
 
         try:
             service.download(key, dest, progress=progress)
-        except ArchyError as exc:
-            self.call_from_thread(self.set_message, f"{key} — {exc}", True)
+        except BuckletError as exc:
+            self.call_from_thread(self.set_message, f"{key}: {exc}", True)
             return
-        self.call_from_thread(self.set_message, f"{key} — downloaded -> {dest}")
+        self.call_from_thread(self.set_message, f"{key}: downloaded -> {dest}")
 
-    def action_upload(self) -> None:
+    def action_upload(self):
         if not self._require_service():
             return
         default_class = storage.normalize_storage_class(self.service.profile.storage_class)
         self.push_screen(UploadScreen(default_class), self._on_upload)
 
-    def _on_upload(self, data: dict | None) -> None:
+    def _on_upload(self, data: dict | None):
         if not data:
             return
         self._upload_worker(data["path"], data["storage_class"], data["prefix"])
 
     @work(thread=True, group="op")
-    def _upload_worker(self, path: str, storage_class: str, prefix: str) -> None:
+    def _upload_worker(self, path: str, storage_class: str, prefix: str):
         service = self.service
         try:
             plan = service.plan_upload([path], prefix=prefix)
-        except ArchyError as exc:
+        except BuckletError as exc:
             self.call_from_thread(self.set_message, str(exc), True)
             return
         for i, (local, key) in enumerate(plan, 1):
             total = max(local.stat().st_size, 1)
             sent = {"n": 0}
 
-            def progress(n: int, sent=sent, key=key, i=i) -> None:
+            def progress(
+                n: int,
+                sent: dict = sent,
+                key: str = key,
+                i: int = i,
+                total: int = total,
+            ):
                 sent["n"] += n
                 self.call_from_thread(
                     self.set_message,
@@ -368,35 +386,35 @@ class ArchyApp(App):
 
             try:
                 service.upload(local, key, storage_class=storage_class, progress=progress)
-            except ArchyError as exc:
-                self.call_from_thread(self.set_message, f"{key} — {exc}", True)
+            except BuckletError as exc:
+                self.call_from_thread(self.set_message, f"{key}: {exc}", True)
                 return
         self.call_from_thread(self.set_message, f"uploaded {len(plan)} file(s)")
         self.call_from_thread(self.reload)
 
-    def action_refresh(self) -> None:
+    def action_refresh(self):
         if self._require_service():
             self.reload()
 
-    def action_search(self) -> None:
+    def action_search(self):
         self.push_screen(PromptScreen("search", self.search_term), self._on_search)
 
-    def _on_search(self, term: str | None) -> None:
+    def _on_search(self, term: str | None):
         if term is None:
             return
         self.search_term = term
         self.refresh_view()
 
-    def action_filter(self) -> None:
+    def action_filter(self):
         idx = _FILTER_CYCLE.index(self.state_filter)
         self.state_filter = _FILTER_CYCLE[(idx + 1) % len(_FILTER_CYCLE)]
         self.refresh_view()
         self.notify(f"filter: {self.state_filter or 'all'}")
 
-    def action_switch_profile(self) -> None:
+    def action_switch_profile(self):
         names = self.config.names()
         if not names:
-            self.notify("no saved profiles — press 'a' to add one", severity="warning")
+            self.notify("no saved profiles. press a to add one", severity="warning")
             return
         labels = []
         for name in names:
@@ -405,33 +423,31 @@ class ArchyApp(App):
             labels.append(f"{name}   {prof.bucket}   ({prof.region or '?'}){default}")
         self.push_screen(ProfileScreen(names, labels), self._on_switch)
 
-    def _on_switch(self, name: str | None) -> None:
+    def _on_switch(self, name: str | None):
         if name:
-            self._open_worker(name)
+            self._open_worker(self.config.get(name))
 
-    def action_add_profile(self) -> None:
+    def action_add_profile(self):
         self.push_screen(AddProfileScreen(), self._on_add)
 
-    def _on_add(self, data: dict | None) -> None:
+    def _on_add(self, data: dict | None):
         if not data:
             return
-        from ..models import Profile
-
         profile = Profile(**data)
         self.config.add(profile)
         self.config.save()
-        self._open_worker(profile.name)
+        self._open_worker(profile)
 
-    @work(thread=True, group="open")
-    def _open_worker(self, name: str) -> None:
+    @work(thread=True, exclusive=True, group="open")
+    def _open_worker(self, profile: Profile):
         try:
-            service = Service.open(self.config.get(name))
-        except ArchyError as exc:
-            self.call_from_thread(self.set_message, f"cannot open '{name}': {exc}", True)
+            service = Service.open(profile)
+        except BuckletError as exc:
+            self.call_from_thread(self.set_message, f"cannot open '{profile.name}': {exc}", True)
             return
         self.call_from_thread(self._activate, service)
 
-    def _activate(self, service: Service) -> None:
+    def _activate(self, service: Service):
         self.service = service
         self.search_term = ""
         self.state_filter = None
@@ -439,16 +455,11 @@ class ArchyApp(App):
         self.reload()
 
 
-def run_tui(config: Config, profile_arg: str | None = None) -> None:
-    """Resolve a profile, open it (best-effort), and launch the app."""
+def run_tui(config: Config, profile_arg: str | None = None):
+    """Launch the TUI right away; the profile opens in the background."""
     profile = config.resolve(profile_arg)
-    service: Service | None = None
+    initial_profile = profile if (profile and profile.bucket) else None
     error = ""
-    if profile is not None and profile.bucket:
-        try:
-            service = Service.open(profile)
-        except ArchyError as exc:
-            error = f"cannot open '{profile.bucket}': {exc}"
-    elif profile_arg:
+    if initial_profile is None and profile_arg:
         error = f"no bucket configured for '{profile_arg}'"
-    ArchyApp(config=config, service=service, error=error).run()
+    BuckletApp(config=config, initial_profile=initial_profile, error=error).run()

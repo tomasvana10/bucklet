@@ -1,9 +1,9 @@
-"""Tests for the pure storage-class + state logic."""
+"""Tests for the pure storage-class and state logic."""
 
 import pytest
 
-from archy import storage
-from archy.errors import ArchyError
+from bucklet import storage
+from bucklet.errors import BuckletError
 
 
 @pytest.mark.parametrize(
@@ -26,7 +26,7 @@ def test_normalize_storage_class(value, expected):
 
 
 def test_normalize_unknown_raises():
-    with pytest.raises(ArchyError) as exc:
+    with pytest.raises(BuckletError) as exc:
         storage.normalize_storage_class("frostbite")
     assert "frostbite" in str(exc.value)
 

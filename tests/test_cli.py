@@ -1,11 +1,15 @@
 """End-to-end CLI tests (config CRUD without AWS, object ops against moto)."""
 
-from archy.cli import main
+from bucklet.cli import main
 
 
-# -- profile management (no AWS) ------------------------------------------- #
 def test_profile_add_and_ls(config_dir, capsys):
-    assert main(["profile", "add", "p", "--bucket", "b", "--region", "us-east-1", "--class", "standard"]) == 0
+    assert (
+        main(
+            ["profile", "add", "p", "--bucket", "b", "--region", "us-east-1", "--class", "standard"]
+        )
+        == 0
+    )
     capsys.readouterr()
     assert main(["profile", "ls"]) == 0
     out = capsys.readouterr().out
@@ -30,10 +34,24 @@ def test_profile_show_archival_note(config_dir, capsys):
     assert "DEEP_ARCHIVE" in out and "thaw" in out
 
 
-# -- object operations (moto) ---------------------------------------------- #
-def _add_profile(bucket, cls="standard"):
-    main(["profile", "add", "p", "--bucket", bucket, "--region", "us-east-1",
-          "--class", cls, "--access-key", "testing", "--secret", "testing"])
+def _add_profile(bucket: str, cls: str = "standard"):
+    main(
+        [
+            "profile",
+            "add",
+            "p",
+            "--bucket",
+            bucket,
+            "--region",
+            "us-east-1",
+            "--class",
+            cls,
+            "--access-key",
+            "testing",
+            "--secret",
+            "testing",
+        ]
+    )
 
 
 def test_up_ls_stat_cycle(config_dir, s3_client, capsys, tmp_path):
@@ -85,7 +103,7 @@ def test_thaw_standard_object_is_noop(config_dir, s3_client, capsys, tmp_path):
     assert "no thaw needed" in capsys.readouterr().out
 
 
-def test_get_downloads(config_dir, s3_client, capsys, tmp_path, monkeypatch):
+def test_get_downloads(config_dir, s3_client, capsys, tmp_path):
     s3_client.create_bucket(Bucket="cli-bucket")
     _add_profile("cli-bucket")
     f = tmp_path / "src.txt"
@@ -99,7 +117,6 @@ def test_get_downloads(config_dir, s3_client, capsys, tmp_path, monkeypatch):
     assert (outdir / key).read_text() == "payload"
 
 
-# -- error paths / exit codes ---------------------------------------------- #
 def test_get_missing_key_exit_1(config_dir, s3_client, capsys):
     s3_client.create_bucket(Bucket="cli-bucket")
     _add_profile("cli-bucket")
@@ -132,11 +149,11 @@ def test_get_download_error_exit_1(config_dir, s3_client, capsys, tmp_path, monk
     main(["up", str(f), "--profile", "p"])
     key = str(f.resolve()).lstrip("/")
 
-    from archy.errors import ArchyError
-    from archy.service import Service
+    from bucklet.errors import BuckletError
+    from bucklet.service import Service
 
-    def boom(self, key, dest, progress=None):
-        raise ArchyError("not restored yet — thaw it first")
+    def boom(self, *args, **kwargs):
+        raise BuckletError("not restored yet, thaw it first")
 
     monkeypatch.setattr(Service, "download", boom)
     capsys.readouterr()
@@ -145,7 +162,6 @@ def test_get_download_error_exit_1(config_dir, s3_client, capsys, tmp_path, monk
     assert "ERR" in out and "not restored" in out
 
 
-# -- ls flags -------------------------------------------------------------- #
 def test_ls_long_search_and_state(config_dir, s3_client, capsys, tmp_path):
     s3_client.create_bucket(Bucket="cli-bucket")
     _add_profile("cli-bucket")  # standard default
@@ -176,7 +192,6 @@ def test_ls_long_search_and_state(config_dir, s3_client, capsys, tmp_path):
     assert kw in avail_out and kc not in avail_out
 
 
-# -- thaw tier selection --------------------------------------------------- #
 def test_thaw_standard_tier_is_passed(config_dir, s3_client, capsys, tmp_path, monkeypatch):
     s3_client.create_bucket(Bucket="cli-bucket")
     _add_profile("cli-bucket", cls="deep_archive")
@@ -185,11 +200,11 @@ def test_thaw_standard_tier_is_passed(config_dir, s3_client, capsys, tmp_path, m
     main(["up", str(f), "--profile", "p"])
     key = str(f.resolve()).lstrip("/")
 
-    from archy.service import Service
+    from bucklet.service import Service
 
     captured = {}
 
-    def spy(self, key, *, tier="Bulk", days=7):
+    def spy(self, _key, *, tier="Bulk", **_):
         captured["tier"] = tier
         return "ok"
 
@@ -199,13 +214,12 @@ def test_thaw_standard_tier_is_passed(config_dir, s3_client, capsys, tmp_path, m
     assert captured["tier"] == "Standard"
 
 
-# -- no subcommand launches the TUI ---------------------------------------- #
 def test_no_subcommand_launches_tui(config_dir, monkeypatch):
-    from archy.tui import app as app_mod
+    from bucklet.tui import app as app_mod
 
     called = {}
 
-    def fake_run_tui(config, profile_arg=None):
+    def fake_run_tui(_config, profile_arg=None):
         called["profile"] = profile_arg
 
     monkeypatch.setattr(app_mod, "run_tui", fake_run_tui)

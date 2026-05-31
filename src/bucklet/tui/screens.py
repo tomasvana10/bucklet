@@ -1,7 +1,8 @@
 """Modal dialogs used by the TUI.
 
-Each screen collects input and returns it via ``dismiss(...)`` (or ``dismiss(None)``
-on cancel), so the app can drive them with ``push_screen(screen, callback)``.
+Each screen collects input and hands it back through ``dismiss(...)`` (or
+``dismiss(None)`` on cancel), so the app can drive them with
+``push_screen(screen, callback)``.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ class DetailScreen(ModalScreen[None]):
             yield Static("\n".join(self._lines))
             yield Label("esc / enter to close", classes="hint")
 
-    def action_dismiss(self) -> None:  # type: ignore[override]
+    def action_dismiss(self):
         self.dismiss(None)
 
 
@@ -58,14 +59,14 @@ class PromptScreen(ModalScreen[str | None]):
             yield Input(value=self._value, id="value")
             yield Label("enter to apply · esc to cancel", classes="hint")
 
-    def on_mount(self) -> None:
+    def on_mount(self):
         self.query_one("#value", Input).focus()
 
     @on(Input.Submitted)
-    def _submit(self) -> None:
+    def _submit(self):
         self.dismiss(self.query_one("#value", Input).value)
 
-    def action_cancel(self) -> None:
+    def action_cancel(self):
         self.dismiss(None)
 
 
@@ -85,14 +86,14 @@ class ProfileScreen(ModalScreen[str | None]):
             yield OptionList(*self._labels, id="profiles")
             yield Label("enter to open · esc to cancel", classes="hint")
 
-    def on_mount(self) -> None:
+    def on_mount(self):
         self.query_one("#profiles", OptionList).focus()
 
     @on(OptionList.OptionSelected)
-    def _selected(self, event: OptionList.OptionSelected) -> None:
+    def _selected(self, event: OptionList.OptionSelected):
         self.dismiss(self._names[event.option_index])
 
-    def action_cancel(self) -> None:
+    def action_cancel(self):
         self.dismiss(None)
 
 
@@ -111,7 +112,9 @@ class AddProfileScreen(ModalScreen[dict | None]):
             yield Label("region")
             yield Input(id="region", placeholder="e.g. ap-southeast-2")
             yield Label("default upload storage class")
-            yield Select(_CLASS_OPTIONS, value=storage.DEFAULT_STORAGE_CLASS, allow_blank=False, id="class")
+            yield Select(
+                _CLASS_OPTIONS, value=storage.DEFAULT_STORAGE_CLASS, allow_blank=False, id="class"
+            )
             yield Label("rclone remote (leave blank to type keys)")
             yield Input(id="rclone", placeholder="rclone remote name")
             yield Label("access key id (optional)")
@@ -124,11 +127,11 @@ class AddProfileScreen(ModalScreen[dict | None]):
                 yield Button("Save", id="ok", variant="primary")
                 yield Button("Cancel", id="cancel")
 
-    def on_mount(self) -> None:
+    def on_mount(self):
         self.query_one("#name", Input).focus()
 
     @on(Button.Pressed, "#ok")
-    def _save(self) -> None:
+    def _save(self):
         name = self.query_one("#name", Input).value.strip()
         bucket = self.query_one("#bucket", Input).value.strip()
         if not name or not bucket:
@@ -148,7 +151,7 @@ class AddProfileScreen(ModalScreen[dict | None]):
         )
 
     @on(Button.Pressed, "#cancel")
-    def action_cancel(self) -> None:
+    def action_cancel(self):
         self.dismiss(None)
 
 
@@ -174,11 +177,11 @@ class UploadScreen(ModalScreen[dict | None]):
                 yield Button("Upload", id="ok", variant="primary")
                 yield Button("Cancel", id="cancel")
 
-    def on_mount(self) -> None:
+    def on_mount(self):
         self.query_one("#path", Input).focus()
 
     @on(Button.Pressed, "#ok")
-    def _upload(self) -> None:
+    def _upload(self):
         path = self.query_one("#path", Input).value.strip()
         if not path:
             self.notify("a path is required", severity="error")
@@ -192,5 +195,5 @@ class UploadScreen(ModalScreen[dict | None]):
         )
 
     @on(Button.Pressed, "#cancel")
-    def action_cancel(self) -> None:
+    def action_cancel(self):
         self.dismiss(None)

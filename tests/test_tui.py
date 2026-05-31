@@ -6,17 +6,22 @@ the app's wiring (loading, filtering, thaw gating, detail) without AWS.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
 from textual.widgets import DataTable
 
-from archy import storage
-from archy.config import Config
-from archy.models import ObjectInfo, ObjectStatus, Profile
-from archy.tui.app import ArchyApp
+from bucklet import storage
+from bucklet.config import Config
+from bucklet.models import ObjectInfo, ObjectStatus, Profile
+from bucklet.tui.app import BuckletApp
 
 
 class FakeService:
     def __init__(self):
-        self.profile = Profile(name="t", bucket="b", region="us-east-1", storage_class="DEEP_ARCHIVE")
+        self.profile = Profile(
+            name="t", bucket="b", region="us-east-1", storage_class="DEEP_ARCHIVE"
+        )
         self.objects = [
             ObjectInfo("cold.bin", 100, None, "DEEP_ARCHIVE"),
             ObjectInfo("doc.txt", 50, None, "STANDARD"),
@@ -27,28 +32,27 @@ class FakeService:
         self.restored: list[tuple[str, str]] = []
         self.downloaded: list[str] = []
 
-    def list_objects(self, prefix=""):
+    def list_objects(self, prefix: str = ""):
         return list(self.objects)
 
-    def status(self, key):
+    def status(self, key: str):
         return self._statuses.get(key) or ObjectStatus(key, storage.AVAILABLE, "STANDARD")
 
-    def restore(self, key, *, tier="Bulk", days=7):
+    def restore(self, key: str, *, tier: str = "Bulk", days: int = 7):
         self.restored.append((key, tier))
         return "restore requested"
 
-    def download(self, key, dest, progress=None):
+    def download(self, key: str, dest: Path, progress: Callable[[int], None] | None = None):
         self.downloaded.append(key)
         return dest
 
 
-def _app(tmp_path, fake) -> ArchyApp:
-    return ArchyApp(config=Config(tmp_path / "config.json"), service=fake)
+def _app(tmp_path: Path, fake: FakeService):
+    return BuckletApp(config=Config(tmp_path / "config.json"), service=fake)
 
 
 async def test_table_populates(tmp_path):
-    fake = FakeService()
-    app = _app(tmp_path, fake)
+    app = _app(tmp_path, FakeService())
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
@@ -126,8 +130,7 @@ async def test_download_cold_object_is_blocked(tmp_path):
 
 
 async def test_detail_screen_opens(tmp_path):
-    fake = FakeService()
-    app = _app(tmp_path, fake)
+    app = _app(tmp_path, FakeService())
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.press("i")
@@ -135,11 +138,21 @@ async def test_detail_screen_opens(tmp_path):
         assert len(app.screen_stack) > 1
 
 
+async def test_ctrl_c_quits(tmp_path):
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app._exit is True
+
+
 async def test_initial_error_is_shown(tmp_path):
     from textual.widgets import Static
 
-    app = ArchyApp(config=Config(tmp_path / "config.json"), service=None,
-                   error="cannot open 'b': denied")
+    app = BuckletApp(
+        config=Config(tmp_path / "config.json"), service=None, error="cannot open 'b': denied"
+    )
     async with app.run_test() as pilot:
         await pilot.pause()
         message = app.query_one("#message", Static)
@@ -147,35 +160,45 @@ async def test_initial_error_is_shown(tmp_path):
         assert message.has_class("error")
 
 
-# -- run_tui entry-point wiring (no event loop needed) --------------------- #
-def test_run_tui_wires_open_error(tmp_path, monkeypatch):
-    from archy.errors import ArchyError
-    from archy.tui import app as app_mod
+async def test_initial_profile_opens_in_background(tmp_path, monkeypatch):
+    from bucklet.tui import app as app_mod
+
+    fake = FakeService()
+    monkeypatch.setattr(app_mod.Service, "open", lambda profile, validate=True: fake)
+    app = BuckletApp(
+        config=Config(tmp_path / "config.json"),
+        initial_profile=Profile(name="p", bucket="b"),
+    )
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.service is fake
+        assert app.query_one(DataTable).row_count == 2
+
+
+def test_run_tui_passes_initial_profile(tmp_path, monkeypatch):
+    from bucklet.tui import app as app_mod
 
     cfg = Config(tmp_path / "config.json")
     cfg.add(Profile(name="p", bucket="bkt"))
     captured = {}
-    monkeypatch.setattr(app_mod.ArchyApp, "run", lambda self, *a, **k: captured.update(app=self))
-
-    def boom(profile, validate=True):
-        raise ArchyError("denied")
-
-    monkeypatch.setattr(app_mod.Service, "open", boom)
+    monkeypatch.setattr(app_mod.BuckletApp, "run", lambda self, *a, **k: captured.update(app=self))
     app_mod.run_tui(cfg, "p")
     app = captured["app"]
+    # The profile opens lazily in a worker, so it is not yet attached.
     assert app.service is None
-    assert "cannot open" in app._initial_error and "denied" in app._initial_error
+    assert app._initial_profile is not None and app._initial_profile.bucket == "bkt"
+    assert app._initial_error == ""
 
 
-def test_run_tui_wires_service(tmp_path, monkeypatch):
-    from archy.tui import app as app_mod
+def test_run_tui_without_profile(tmp_path, monkeypatch):
+    from bucklet.tui import app as app_mod
 
-    cfg = Config(tmp_path / "config.json")
-    cfg.add(Profile(name="p", bucket="bkt"))
+    cfg = Config(tmp_path / "config.json")  # nothing configured
     captured = {}
-    sentinel = object()
-    monkeypatch.setattr(app_mod.ArchyApp, "run", lambda self, *a, **k: captured.update(app=self))
-    monkeypatch.setattr(app_mod.Service, "open", lambda profile, validate=True: sentinel)
-    app_mod.run_tui(cfg, "p")
-    assert captured["app"].service is sentinel
-    assert captured["app"]._initial_error == ""
+    monkeypatch.setattr(app_mod.BuckletApp, "run", lambda self, *a, **k: captured.update(app=self))
+    app_mod.run_tui(cfg, None)
+    app = captured["app"]
+    assert app.service is None
+    assert app._initial_profile is None
+    assert app._initial_error == ""

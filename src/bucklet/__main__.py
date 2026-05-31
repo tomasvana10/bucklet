@@ -1,4 +1,4 @@
-"""Allow ``python -m archy``."""
+"""Run bucklet with ``python -m bucklet``."""
 
 import sys
 

@@ -2,32 +2,47 @@
 
 import pytest
 
-from archy import s3, storage
-from archy.errors import ArchyError
-from archy.models import Profile
+from bucklet import s3, storage
+from bucklet.errors import BuckletError
+from bucklet.models import Profile
 
 
 def test_validate_ok(s3_client):
     s3_client.create_bucket(Bucket="the-bucket")
-    profile = Profile(name="t", bucket="the-bucket", region="us-east-1",
-                      access_key_id="testing", secret_access_key="testing")
+    profile = Profile(
+        name="t",
+        bucket="the-bucket",
+        region="us-east-1",
+        access_key_id="testing",
+        secret_access_key="testing",
+    )
     client = s3.build_client(profile)
     s3.validate(client, "the-bucket")  # should not raise
 
 
 def test_validate_missing_bucket(s3_client):
-    profile = Profile(name="t", bucket="ghost", region="us-east-1",
-                      access_key_id="testing", secret_access_key="testing")
+    profile = Profile(
+        name="t",
+        bucket="ghost",
+        region="us-east-1",
+        access_key_id="testing",
+        secret_access_key="testing",
+    )
     client = s3.build_client(profile)
-    with pytest.raises(ArchyError) as exc:
+    with pytest.raises(BuckletError) as exc:
         s3.validate(client, "ghost")
     assert "not found" in str(exc.value)
 
 
 def test_upload_list_head_roundtrip(s3_client, tmp_path):
     s3_client.create_bucket(Bucket="the-bucket")
-    profile = Profile(name="t", bucket="the-bucket", region="us-east-1",
-                      access_key_id="testing", secret_access_key="testing")
+    profile = Profile(
+        name="t",
+        bucket="the-bucket",
+        region="us-east-1",
+        access_key_id="testing",
+        secret_access_key="testing",
+    )
     client = s3.build_client(profile)
 
     src = tmp_path / "hello.txt"
@@ -45,8 +60,15 @@ def test_upload_list_head_roundtrip(s3_client, tmp_path):
 
 def test_head_standard_is_available(s3_client, tmp_path):
     s3_client.create_bucket(Bucket="the-bucket")
-    client = s3.build_client(Profile(name="t", bucket="the-bucket", region="us-east-1",
-                                     access_key_id="testing", secret_access_key="testing"))
+    client = s3.build_client(
+        Profile(
+            name="t",
+            bucket="the-bucket",
+            region="us-east-1",
+            access_key_id="testing",
+            secret_access_key="testing",
+        )
+    )
     src = tmp_path / "f"
     src.write_text("x")
     s3.upload_file(client, "the-bucket", src, "f", "STANDARD")
@@ -55,8 +77,15 @@ def test_head_standard_is_available(s3_client, tmp_path):
 
 def test_download_roundtrip(s3_client, tmp_path):
     s3_client.create_bucket(Bucket="the-bucket")
-    client = s3.build_client(Profile(name="t", bucket="the-bucket", region="us-east-1",
-                                     access_key_id="testing", secret_access_key="testing"))
+    client = s3.build_client(
+        Profile(
+            name="t",
+            bucket="the-bucket",
+            region="us-east-1",
+            access_key_id="testing",
+            secret_access_key="testing",
+        )
+    )
     src = tmp_path / "f"
     src.write_text("payload")
     s3.upload_file(client, "the-bucket", src, "k", "STANDARD")
@@ -68,8 +97,15 @@ def test_download_roundtrip(s3_client, tmp_path):
 
 def test_restore_moves_off_cold(s3_client, tmp_path):
     s3_client.create_bucket(Bucket="the-bucket")
-    client = s3.build_client(Profile(name="t", bucket="the-bucket", region="us-east-1",
-                                     access_key_id="testing", secret_access_key="testing"))
+    client = s3.build_client(
+        Profile(
+            name="t",
+            bucket="the-bucket",
+            region="us-east-1",
+            access_key_id="testing",
+            secret_access_key="testing",
+        )
+    )
     src = tmp_path / "f"
     src.write_text("x")
     s3.upload_file(client, "the-bucket", src, "k", "DEEP_ARCHIVE")
@@ -80,7 +116,7 @@ def test_restore_moves_off_cold(s3_client, tmp_path):
     assert s3.head_status(client, "the-bucket", "k").state != storage.COLD
 
 
-def _client_error(code, message=""):
+def _client_error(code: str, message: str = ""):
     from botocore.exceptions import ClientError
 
     return ClientError({"Error": {"Code": code, "Message": message}}, "Op")
@@ -89,11 +125,23 @@ def _client_error(code, message=""):
 def test_client_error_message_mapping():
     assert s3._client_error_message(_client_error("404")) == "bucket not found"
     assert s3._client_error_message(_client_error("NoSuchBucket")) == "bucket not found"
-    assert s3._client_error_message(_client_error("403")) == "access denied (check the IAM policy and keys)"
-    assert s3._client_error_message(_client_error("AccessDenied")) == "access denied (check the IAM policy and keys)"
+    assert (
+        s3._client_error_message(_client_error("403"))
+        == "access denied (check the IAM policy and keys)"
+    )
+    assert (
+        s3._client_error_message(_client_error("AccessDenied"))
+        == "access denied (check the IAM policy and keys)"
+    )
     assert s3._client_error_message(_client_error("301")) == "wrong region for this bucket"
-    assert s3._client_error_message(_client_error("PermanentRedirect")) == "wrong region for this bucket"
-    assert s3._client_error_message(_client_error("AuthorizationHeaderMalformed")) == "wrong region for this bucket"
+    assert (
+        s3._client_error_message(_client_error("PermanentRedirect"))
+        == "wrong region for this bucket"
+    )
+    assert (
+        s3._client_error_message(_client_error("AuthorizationHeaderMalformed"))
+        == "wrong region for this bucket"
+    )
     # an unrelated message mentioning 'endpoint' must NOT be mistaken for a region error
     msg = s3._client_error_message(_client_error("InvalidRequest", "bad endpoint configuration"))
     assert msg == "InvalidRequest: bad endpoint configuration"
@@ -101,8 +149,8 @@ def test_client_error_message_mapping():
 
 def test_download_invalid_object_state_raises(tmp_path):
     class FakeClient:
-        def download_file(self, *a, **k):
+        def download_file(self, *args, **kwargs):
             raise _client_error("InvalidObjectState")
 
-    with pytest.raises(ArchyError, match="not restored yet"):
+    with pytest.raises(BuckletError, match="not restored yet"):
         s3.download_file(FakeClient(), "the-bucket", "k", tmp_path / "out" / "f")

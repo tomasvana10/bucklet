@@ -1,22 +1,22 @@
-"""Tests for profile config: CRUD, resolution, materialization, migration."""
-
-import json
+"""Tests for profile config: CRUD, resolution, materialization."""
 
 import pytest
 
-from archy.config import Config
-from archy.errors import ArchyError
-from archy.models import Profile
+from bucklet.config import Config
+from bucklet.errors import BuckletError
+from bucklet.models import Profile
 
 
-def test_empty_when_no_file(config_dir):
+@pytest.mark.usefixtures("config_dir")
+def test_empty_when_no_file():
     cfg = Config.load()
     assert cfg.profiles == {}
     assert cfg.default is None
     assert cfg.resolve(None) is None
 
 
-def test_add_save_load_roundtrip(config_dir):
+@pytest.mark.usefixtures("config_dir")
+def test_add_save_load_roundtrip():
     cfg = Config.load()
     cfg.add(Profile(name="cold", bucket="b", region="r", storage_class="DEEP_ARCHIVE"))
     cfg.save()
@@ -28,7 +28,8 @@ def test_add_save_load_roundtrip(config_dir):
     assert prof.storage_class == "DEEP_ARCHIVE"
 
 
-def test_default_handling(config_dir):
+@pytest.mark.usefixtures("config_dir")
+def test_default_handling():
     cfg = Config.load()
     cfg.add(Profile(name="a", bucket="ba"))
     cfg.add(Profile(name="b", bucket="bb"))
@@ -39,16 +40,17 @@ def test_default_handling(config_dir):
     cfg.remove("c")
     assert cfg.default in ("a", "b")  # reassigned to a remaining profile
 
-    with pytest.raises(ArchyError):
+    with pytest.raises(BuckletError):
         cfg.set_default("ghost")
 
 
-def test_resolve_modes(config_dir):
+@pytest.mark.usefixtures("config_dir")
+def test_resolve_modes():
     cfg = Config.load()
     cfg.add(Profile(name="saved", bucket="saved-bucket"))
     # saved name
     assert cfg.resolve("saved").bucket == "saved-bucket"
-    # unknown name -> treated as a raw bucket
+    # unknown name is treated as a raw bucket
     raw = cfg.resolve("random-bucket")
     assert raw.bucket == "random-bucket"
     assert raw.name == "random-bucket"
@@ -56,14 +58,16 @@ def test_resolve_modes(config_dir):
     assert cfg.resolve(None).name == "saved"
 
 
-def test_materialize_region_from_env(config_dir, monkeypatch):
+@pytest.mark.usefixtures("config_dir")
+def test_materialize_region_from_env(monkeypatch):
     monkeypatch.setenv("AWS_REGION", "eu-west-1")
     cfg = Config.load()
     cfg.add(Profile(name="p", bucket="b"))
     assert cfg.get("p").region == "eu-west-1"
 
 
-def test_materialize_rclone_credentials(config_dir, tmp_path, monkeypatch):
+@pytest.mark.usefixtures("config_dir")
+def test_materialize_rclone_credentials(tmp_path, monkeypatch):
     rclone = tmp_path / "rclone.conf"
     rclone.write_text(
         "[remote]\ntype = s3\naccess_key_id = AK\nsecret_access_key = SK\nregion = ap-southeast-2\n"
@@ -77,40 +81,22 @@ def test_materialize_rclone_credentials(config_dir, tmp_path, monkeypatch):
     assert prof.region == "ap-southeast-2"
 
 
-def test_explicit_keys_override_rclone(config_dir, tmp_path, monkeypatch):
+@pytest.mark.usefixtures("config_dir")
+def test_explicit_keys_override_rclone(tmp_path, monkeypatch):
     rclone = tmp_path / "rclone.conf"
     rclone.write_text("[remote]\ntype = s3\naccess_key_id = FROM_RCLONE\nsecret_access_key = X\n")
     monkeypatch.setenv("RCLONE_CONFIG", str(rclone))
     cfg = Config.load()
-    cfg.add(Profile(name="p", bucket="b", rclone_remote="remote",
-                    access_key_id="EXPLICIT", secret_access_key="Y"))
+    cfg.add(
+        Profile(
+            name="p",
+            bucket="b",
+            rclone_remote="remote",
+            access_key_id="EXPLICIT",
+            secret_access_key="Y",
+        )
+    )
     assert cfg.get("p").access_key_id == "EXPLICIT"
-
-
-def test_migration_from_deeparch(config_dir, tmp_path):
-    legacy = tmp_path / ".config" / "deeparch" / "config.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text(json.dumps({
-        "default": "old",
-        "profiles": {"old": {"bucket": "legacy-bucket", "region": "us-east-1"}},
-    }))
-
-    cfg = Config.load()  # archy config absent -> migrates
-    assert cfg.default == "old"
-    prof = cfg.get("old")
-    assert prof.bucket == "legacy-bucket"
-    # deeparch only ever used DEEP_ARCHIVE, so migrated profiles inherit it.
-    assert prof.storage_class == "DEEP_ARCHIVE"
-    # and it was written to the new location.
-    assert (config_dir / "config.json").exists()
-
-
-def test_no_migration_when_disabled(config_dir, tmp_path):
-    legacy = tmp_path / ".config" / "deeparch" / "config.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text(json.dumps({"profiles": {"old": {"bucket": "b"}}}))
-    cfg = Config.load(migrate=False)
-    assert cfg.profiles == {}
 
 
 def test_save_permissions(config_dir):

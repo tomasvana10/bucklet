@@ -1,20 +1,25 @@
 """Thin boto3 wrappers.
 
-Every function here translates the boto3/botocore exception zoo into a single
-:class:`~archy.errors.ArchyError` with a readable message, and returns plain
-Python data. Nothing above this layer should import boto3. boto3 itself is
-imported lazily so that ``archy --help`` and profile management stay fast and
-work even if boto3's import is slow.
+Every function here turns the boto3/botocore exception zoo into a single
+:class:`~bucklet.errors.BuckletError` with a readable message, and returns plain
+Python data. Nothing above this layer should import boto3. boto3 is imported
+lazily so that ``bucklet --help`` and profile management stay fast and keep
+working even when boto3 is slow to import.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import storage
-from .errors import ArchyError
+from .errors import BuckletError
 from .models import ObjectInfo, ObjectStatus, Profile
+
+if TYPE_CHECKING:
+    from botocore.client import BaseClient
+    from botocore.exceptions import ClientError
 
 
 def build_client(profile: Profile):
@@ -38,7 +43,7 @@ def build_client(profile: Profile):
     return boto3.client("s3", **kwargs)
 
 
-def _client_error_message(exc) -> str:
+def _client_error_message(exc: ClientError) -> str:
     err = getattr(exc, "response", {}).get("Error", {})
     code = str(err.get("Code", "")) or "error"
     message = err.get("Message", "")
@@ -51,8 +56,8 @@ def _client_error_message(exc) -> str:
     return f"{code}: {message}" if message else code
 
 
-def validate(client, bucket: str) -> None:
-    """Raise :class:`ArchyError` unless the bucket is reachable and readable."""
+def validate(client: BaseClient, bucket: str):
+    """Raise :class:`BuckletError` unless the bucket is reachable and readable."""
     from botocore.exceptions import (
         ClientError,
         EndpointConnectionError,
@@ -62,17 +67,17 @@ def validate(client, bucket: str) -> None:
     try:
         client.head_bucket(Bucket=bucket)
     except NoCredentialsError as exc:
-        raise ArchyError(
+        raise BuckletError(
             "no AWS credentials found (set keys in the profile, point it at an "
             "rclone remote, or configure the AWS environment)"
         ) from exc
     except EndpointConnectionError as exc:
-        raise ArchyError("cannot reach S3 (check region / network)") from exc
+        raise BuckletError("cannot reach S3 (check region / network)") from exc
     except ClientError as exc:
-        raise ArchyError(_client_error_message(exc)) from exc
+        raise BuckletError(_client_error_message(exc)) from exc
 
 
-def list_objects(client, bucket: str, prefix: str = "") -> Iterator[ObjectInfo]:
+def list_objects(client: BaseClient, bucket: str, prefix: str = ""):
     """Yield every object under ``prefix`` (paginated)."""
     from botocore.exceptions import ClientError
 
@@ -87,10 +92,10 @@ def list_objects(client, bucket: str, prefix: str = "") -> Iterator[ObjectInfo]:
                     storage_class=obj.get("StorageClass", "STANDARD"),
                 )
     except ClientError as exc:
-        raise ArchyError(_client_error_message(exc)) from exc
+        raise BuckletError(_client_error_message(exc)) from exc
 
 
-def head_status(client, bucket: str, key: str) -> ObjectStatus:
+def head_status(client: BaseClient, bucket: str, key: str):
     """HEAD one object and return its resolved :class:`ObjectStatus`."""
     from botocore.exceptions import ClientError
 
@@ -110,7 +115,7 @@ def head_status(client, bucket: str, key: str) -> ObjectStatus:
     )
 
 
-def restore_object(client, bucket: str, key: str, tier: str = "Bulk", days: int = 7) -> str:
+def restore_object(client: BaseClient, bucket: str, key: str, tier: str = "Bulk", days: int = 7):
     """Begin a restore. Returns a status message; raises on hard errors."""
     from botocore.exceptions import ClientError
 
@@ -125,13 +130,17 @@ def restore_object(client, bucket: str, key: str, tier: str = "Bulk", days: int 
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code == "RestoreAlreadyInProgress":
             return "restore already in progress"
-        raise ArchyError(_client_error_message(exc)) from exc
+        raise BuckletError(_client_error_message(exc)) from exc
 
 
 def download_file(
-    client, bucket: str, key: str, dest: Path, callback: Callable[[int], None] | None = None
-) -> None:
-    """Download ``key`` to ``dest`` (parents created)."""
+    client: BaseClient,
+    bucket: str,
+    key: str,
+    dest: Path,
+    callback: Callable[[int], None] | None = None,
+):
+    """Download ``key`` to ``dest`` (parent directories created)."""
     from botocore.exceptions import ClientError
 
     Path(dest).parent.mkdir(parents=True, exist_ok=True)
@@ -140,18 +149,18 @@ def download_file(
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code == "InvalidObjectState":
-            raise ArchyError("not restored yet — thaw it first") from exc
-        raise ArchyError(_client_error_message(exc)) from exc
+            raise BuckletError("not restored yet, thaw it first") from exc
+        raise BuckletError(_client_error_message(exc)) from exc
 
 
 def upload_file(
-    client,
+    client: BaseClient,
     bucket: str,
     local_path: Path,
     key: str,
     storage_class: str,
     callback: Callable[[int], None] | None = None,
-) -> None:
+):
     """Upload a local file to ``key`` in the given storage class."""
     from boto3.s3.transfer import TransferConfig
     from botocore.exceptions import ClientError
@@ -170,4 +179,4 @@ def upload_file(
             Callback=callback,
         )
     except ClientError as exc:
-        raise ArchyError(_client_error_message(exc)) from exc
+        raise BuckletError(_client_error_message(exc)) from exc

@@ -2,21 +2,26 @@
 
 import pytest
 
-from archy import storage
-from archy.errors import ArchyError
-from archy.models import ObjectStatus, Profile
-from archy.service import Service
+from bucklet import storage
+from bucklet.errors import BuckletError
+from bucklet.models import ObjectStatus, Profile
+from bucklet.service import Service
 
 
 def test_open_validates_bucket(s3_client):
-    profile = Profile(name="t", bucket="ghost", region="us-east-1",
-                      access_key_id="testing", secret_access_key="testing")
-    with pytest.raises(ArchyError):
+    profile = Profile(
+        name="t",
+        bucket="ghost",
+        region="us-east-1",
+        access_key_id="testing",
+        secret_access_key="testing",
+    )
+    with pytest.raises(BuckletError):
         Service.open(profile)
 
 
 def test_open_requires_bucket():
-    with pytest.raises(ArchyError):
+    with pytest.raises(BuckletError):
         Service.open(Profile(name="t", bucket=None), validate=False)
 
 
@@ -92,7 +97,7 @@ def test_plan_upload_prefix(tmp_path):
 
 
 def test_plan_upload_missing_path(tmp_path):
-    with pytest.raises(ArchyError):
+    with pytest.raises(BuckletError):
         Service.plan_upload([tmp_path / "nope"])
 
 
@@ -132,8 +137,7 @@ def test_resolve_keys_literal_glob_chars(make_service, tmp_path):
     assert set(res3.matched) == {"report?.pdf", "reportX.pdf"}
 
 
-# -- restore message branches (gating), driven by stubbing status ---------- #
-def _force_status(svc, status, monkeypatch):
+def _force_status(svc: Service, status: ObjectStatus, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(svc, "status", lambda key: status)
 
 
@@ -147,7 +151,9 @@ def test_restore_thawed_message_with_expiry(make_service, monkeypatch):
     svc = make_service()
     _force_status(
         svc,
-        ObjectStatus("k", storage.THAWED, "DEEP_ARCHIVE", restore_expiry="Fri, 21 Dec 2012 00:00:00 GMT"),
+        ObjectStatus(
+            "k", storage.THAWED, "DEEP_ARCHIVE", restore_expiry="Fri, 21 Dec 2012 00:00:00 GMT"
+        ),
         monkeypatch,
     )
     assert "already restored (until Fri, 21 Dec 2012 00:00:00 GMT)" in svc.restore("k")
@@ -163,5 +169,5 @@ def test_restore_thawed_message_without_expiry(make_service, monkeypatch):
 def test_restore_error_raises(make_service, monkeypatch):
     svc = make_service()
     _force_status(svc, ObjectStatus("k", storage.ERROR, error="boom"), monkeypatch)
-    with pytest.raises(ArchyError, match="boom"):
+    with pytest.raises(BuckletError, match="boom"):
         svc.restore("k")

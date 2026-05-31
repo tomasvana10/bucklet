@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import re
 
-from .errors import ArchyError
+from .errors import BuckletError
 
-# Canonical S3 storage classes archy can upload into, cheapest-retrieval first.
+# Canonical S3 storage classes bucklet can upload into, cheapest-retrieval first.
 STORAGE_CLASSES: tuple[str, ...] = (
     "STANDARD",
     "REDUCED_REDUNDANCY",
@@ -53,11 +53,11 @@ _ALIASES = {
 
 # Object states (front-end-neutral identifiers).
 AVAILABLE = "available"  # downloadable right now
-COLD = "cold"            # archived, needs a restore first
-THAWING = "thawing"      # restore in progress
-THAWED = "thawed"        # restored, downloadable until it expires
-ERROR = "error"          # status could not be read
-UNKNOWN = "unknown"      # status not fetched yet
+COLD = "cold"  # archived, needs a restore first
+THAWING = "thawing"  # restore in progress
+THAWED = "thawed"  # restored, downloadable until it expires
+ERROR = "error"  # status could not be read
+UNKNOWN = "unknown"  # status not fetched yet
 
 STATES = (AVAILABLE, COLD, THAWING, THAWED, ERROR, UNKNOWN)
 
@@ -76,17 +76,17 @@ def normalize_storage_class(value: str) -> str:
     """Resolve a user-supplied class name/alias to a canonical S3 class.
 
     Accepts any case and either '-' or '_' separators, plus the short aliases
-    in :data:`_ALIASES`. Raises :class:`ArchyError` for anything unknown.
+    in :data:`_ALIASES`. Raises :class:`BuckletError` for anything unknown.
     """
     if value is None:
-        raise ArchyError("no storage class given")
+        raise BuckletError("no storage class given")
     key = value.strip().upper().replace("-", "_")
     if key in STORAGE_CLASSES:
         return key
     if key in _ALIASES:
         return _ALIASES[key]
     choices = ", ".join(c.lower() for c in STORAGE_CLASSES)
-    raise ArchyError(f"unknown storage class {value!r} (choose from: {choices})")
+    raise BuckletError(f"unknown storage class {value!r} (choose from: {choices})")
 
 
 def needs_restore(storage_class: str | None) -> bool:
@@ -95,7 +95,7 @@ def needs_restore(storage_class: str | None) -> bool:
 
 
 def object_state(storage_class: str | None, restore_header: str | None) -> str:
-    """Map an object's storage class + S3 ``Restore`` header to a state.
+    """Map a storage class and the S3 ``Restore`` header to a state.
 
     The ``Restore`` header (from ``head_object``) looks like::
 

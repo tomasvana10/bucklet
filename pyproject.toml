@@ -1,19 +1,29 @@
 [project]
-name = "archy"
+name = "bucklet"
 version = "0.1.0"
-description = "Browse, upload, download and restore objects across S3 buckets — any storage class — from a CLI or a Textual TUI."
+description = "Browse, upload, download and restore S3 objects in any storage class, from a CLI or a TUI."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Tomas Vana" }]
+keywords = ["s3", "glacier", "deep-archive", "tui", "cli", "backup"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+]
 dependencies = [
     "boto3>=1.43.18",
+    "platformdirs>=4.10.0",
     "textual>=8.2.7",
 ]
 
 [project.scripts]
-archy = "archy.cli:main"
+bucklet = "bucklet.cli:main"
 
 [project.urls]
-Repository = "https://github.com/tomasvana/archy"
+Repository = "https://github.com/tomasvana/bucklet"
 
 [build-system]
 requires = ["uv_build>=0.11.2,<0.12.0"]
@@ -24,10 +34,19 @@ testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
 [dependency-groups]
 dev = [
     "moto[s3]>=5.2.1",
+    "pre-commit>=4.6.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
+    "ruff>=0.15.15",
 ]

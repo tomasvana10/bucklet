@@ -1,6 +1,8 @@
 """Tests for reading credentials out of an rclone config."""
 
-from archy.rclone import creds_from_rclone
+from pathlib import Path
+
+from bucklet.rclone import creds_from_rclone
 
 SAMPLE = """\
 [backup]
@@ -16,7 +18,7 @@ type = drive
 """
 
 
-def _write(tmp_path, text=SAMPLE):
+def _write(tmp_path: Path, text: str = SAMPLE) -> Path:
     path = tmp_path / "rclone.conf"
     path.write_text(text)
     return path

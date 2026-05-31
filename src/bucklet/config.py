@@ -1,6 +1,7 @@
-"""Saved profiles, default selection, and migration from deeparch.
+"""Saved profiles and the default-profile selection.
 
-The config is a small JSON file (default ``~/.config/archy/config.json``)::
+The config is a small JSON file living in the user config directory
+(``<config dir>/config.json``)::
 
     {
       "default": "cold",
@@ -12,8 +13,9 @@ The config is a small JSON file (default ``~/.config/archy/config.json``)::
     }
 
 :class:`Config` is the only thing the front-ends touch. It turns the stored
-dicts into fully-resolved :class:`~archy.models.Profile` objects (credentials
-filled in from rclone / environment) and writes changes back atomically.
+dicts into fully resolved :class:`~bucklet.models.Profile` objects, with
+credentials filled in from rclone or the environment, and writes changes back
+atomically.
 """
 
 from __future__ import annotations
@@ -22,12 +24,14 @@ import json
 import os
 from pathlib import Path
 
+from platformdirs import user_config_dir
+
 from . import storage
-from .errors import ArchyError
+from .errors import BuckletError
 from .models import Profile
 from .rclone import creds_from_rclone
 
-# Persisted profile keys (everything else on Profile is derived/runtime).
+# Persisted profile keys. Everything else on Profile is derived at runtime.
 _STORED_KEYS = (
     "bucket",
     "region",
@@ -40,40 +44,39 @@ _STORED_KEYS = (
 
 
 def default_config_dir() -> Path:
-    """archy's config directory, honouring ``$ARCHY_CONFIG_DIR``."""
-    return Path(
-        os.environ.get("ARCHY_CONFIG_DIR", str(Path.home() / ".config" / "archy"))
-    )
+    """bucklet's config directory, overridable with ``$BUCKLET_CONFIG_DIR``.
 
-
-def _legacy_deeparch_config() -> Path:
-    return Path.home() / ".config" / "deeparch" / "config.json"
+    Without the override this is the platform's standard per-user config
+    location (``~/.config/bucklet`` on Linux, the equivalent elsewhere).
+    """
+    override = os.environ.get("BUCKLET_CONFIG_DIR")
+    return Path(override) if override else Path(user_config_dir("bucklet"))
 
 
 class Config:
     """In-memory view of the config file, with profile CRUD and resolution."""
 
-    def __init__(self, path: Path, profiles: dict | None = None, default: str | None = None):
+    def __init__(
+        self,
+        path: Path,
+        profiles: dict[str, dict] | None = None,
+        default: str | None = None,
+    ):
         self.path = Path(path)
         self.profiles: dict[str, dict] = profiles or {}
         self.default: str | None = default
 
-    # -- loading / saving ------------------------------------------------- #
     @classmethod
-    def load(cls, config_dir: Path | None = None, *, migrate: bool = True) -> "Config":
-        """Load the config, optionally importing a legacy deeparch config."""
+    def load(cls, config_dir: Path | None = None):
+        """Load the config from ``config_dir`` (or the default location)."""
         directory = Path(config_dir) if config_dir else default_config_dir()
         path = directory / "config.json"
         if path.exists():
             return cls._read(path)
-        if migrate:
-            migrated = cls._migrate_from_deeparch(path)
-            if migrated is not None:
-                return migrated
         return cls(path)
 
     @classmethod
-    def _read(cls, path: Path) -> "Config":
+    def _read(cls, path: Path):
         try:
             data = json.loads(Path(path).read_text())
         except (OSError, ValueError):
@@ -85,36 +88,15 @@ class Config:
             profiles = {}
         return cls(path, profiles=profiles, default=data.get("default"))
 
-    @classmethod
-    def _migrate_from_deeparch(cls, new_path: Path) -> "Config | None":
-        """Import ``~/.config/deeparch/config.json`` once, if present.
+    def save(self):
+        """Write the config back atomically, readable only by its owner.
 
-        deeparch only ever uploaded DEEP_ARCHIVE, so migrated profiles inherit
-        that as their default upload class to preserve behaviour.
-        """
-        legacy = _legacy_deeparch_config()
-        if not legacy.exists():
-            return None
-        old = cls._read(legacy)
-        if not old.profiles:
-            return None
-        for stored in old.profiles.values():
-            stored.setdefault("storage_class", "DEEP_ARCHIVE")
-        cfg = cls(new_path, profiles=old.profiles, default=old.default)
-        cfg.save()
-        return cfg
-
-    def save(self) -> None:
-        """Write the config back, atomically, with owner-only permissions.
-
-        The file may hold secret keys, so the temp file is created 0600 from
-        the outset (never group/world-readable, even briefly) and only then
-        atomically renamed into place.
+        The file can hold secret keys, so the temp file is created 0600 from the
+        start (never group- or world-readable, even briefly) and only then
+        renamed into place.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            {"default": self.default, "profiles": self.profiles}, indent=2
-        )
+        payload = json.dumps({"default": self.default, "profiles": self.profiles}, indent=2)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -125,20 +107,19 @@ class Config:
             fh.write(payload)
         os.replace(tmp, self.path)
 
-    # -- queries ---------------------------------------------------------- #
-    def names(self) -> list[str]:
+    def names(self):
         return list(self.profiles)
 
-    def has(self, name: str) -> bool:
+    def has(self, name: str):
         return name in self.profiles
 
-    def stored(self, name: str) -> dict:
+    def stored(self, name: str):
         if name not in self.profiles:
-            raise ArchyError(f"no such profile: {name}")
+            raise BuckletError(f"no such profile: {name}")
         return self.profiles[name]
 
-    def materialize(self, name: str, stored: dict) -> Profile:
-        """Turn a stored dict into a fully-resolved Profile."""
+    def materialize(self, name: str, stored: dict):
+        """Turn a stored dict into a fully resolved Profile."""
         prof = Profile(
             name=name,
             bucket=stored.get("bucket"),
@@ -156,33 +137,30 @@ class Config:
             prof.region = prof.region or rc.get("region")
             prof.endpoint_url = prof.endpoint_url or rc.get("endpoint_url")
         prof.region = (
-            prof.region
-            or os.environ.get("AWS_REGION")
-            or os.environ.get("AWS_DEFAULT_REGION")
+            prof.region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         )
         return prof
 
-    def get(self, name: str) -> Profile:
+    def get(self, name: str):
         return self.materialize(name, self.stored(name))
 
     def resolve(self, profile_arg: str | None) -> Profile | None:
         """Pick the profile to operate on.
 
-        Order: an explicit ``profile_arg`` (a saved name, else treated as a raw
-        bucket name using the AWS chain), then the configured default. Returns
-        ``None`` when nothing is configured.
+        Try an explicit ``profile_arg`` first (a saved name, otherwise treated as
+        a raw bucket name using the AWS chain), then the configured default.
+        Returns ``None`` when nothing is configured.
         """
         if profile_arg:
             if self.has(profile_arg):
                 return self.get(profile_arg)
-            # Not a saved profile: treat it as a raw bucket name.
+            # Not a saved profile, so treat it as a raw bucket name.
             return self.materialize(profile_arg, {"bucket": profile_arg})
         if self.default and self.has(self.default):
             return self.get(self.default)
         return None
 
-    # -- mutation --------------------------------------------------------- #
-    def add(self, profile: Profile, *, make_default: bool = False) -> None:
+    def add(self, profile: Profile, *, make_default: bool = False):
         stored = {}
         for key in _STORED_KEYS:
             value = getattr(profile, key, None)
@@ -192,14 +170,14 @@ class Config:
         if make_default or not self.default:
             self.default = profile.name
 
-    def remove(self, name: str) -> None:
+    def remove(self, name: str):
         if name not in self.profiles:
-            raise ArchyError(f"no such profile: {name}")
+            raise BuckletError(f"no such profile: {name}")
         del self.profiles[name]
         if self.default == name:
             self.default = next(iter(self.profiles), None)
 
-    def set_default(self, name: str) -> None:
+    def set_default(self, name: str):
         if name not in self.profiles:
-            raise ArchyError(f"no such profile: {name}")
+            raise BuckletError(f"no such profile: {name}")
         self.default = name

@@ -15,9 +15,7 @@ from pathlib import Path
 def default_rclone_conf() -> Path:
     """Where rclone keeps its config, honouring ``$RCLONE_CONFIG``."""
     return Path(
-        os.environ.get(
-            "RCLONE_CONFIG", str(Path.home() / ".config" / "rclone" / "rclone.conf")
-        )
+        os.environ.get("RCLONE_CONFIG", str(Path.home() / ".config" / "rclone" / "rclone.conf"))
     )
 
 

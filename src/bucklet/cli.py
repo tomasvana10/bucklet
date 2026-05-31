@@ -1,7 +1,7 @@
 """Command-line front-end.
 
-Every subcommand operates on one profile (``--profile NAME``, accepted before
-or after the subcommand; falls back to the configured default). Running archy
+Every subcommand operates on one profile (``--profile NAME``, accepted before or
+after the subcommand; it falls back to the configured default). Running bucklet
 with no subcommand launches the Textual TUI. The CLI is a complete superset of
 the TUI: anything you can do interactively you can script here.
 """
@@ -14,18 +14,15 @@ from pathlib import Path
 
 from . import storage
 from .config import Config
-from .errors import ArchyError
+from .errors import BuckletError
 from .formatting import fmt_date, human
 from .models import Profile
 from .service import Service
 
-PROG = "archy"
+PROG = "bucklet"
 
 
-# --------------------------------------------------------------------------- #
-# parser
-# --------------------------------------------------------------------------- #
-def build_parser() -> argparse.ArgumentParser:
+def build_parser():
     # Shared --profile, added to the top parser and every subparser so it works
     # in either position. SUPPRESS keeps a subparser default from clobbering a
     # value given before the subcommand.
@@ -38,15 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
         "defaults to the configured default profile",
     )
 
-    class_help = "storage class (e.g. %s)" % ", ".join(
-        c.lower() for c in storage.STORAGE_CLASSES
-    )
+    class_list = ", ".join(c.lower() for c in storage.STORAGE_CLASSES)
+    class_help = f"storage class (e.g. {class_list})"
 
     p = argparse.ArgumentParser(
         prog=PROG,
         parents=[common],
-        description="Browse, upload, download and restore objects across S3 buckets "
-        "of any storage class — from the CLI or the Textual TUI.",
+        description="Browse, upload, download and restore S3 objects in any storage "
+        "class, from the CLI or the Textual TUI.",
     )
     sub = p.add_subparsers(dest="cmd")
 
@@ -67,14 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="Bulk",
         help="restore tier (default Bulk, ~48h, cheapest)",
     )
+    thaw.add_argument("--standard", action="store_true", help="shortcut for --tier Standard (~12h)")
     thaw.add_argument(
-        "--standard", action="store_true", help="shortcut for --tier Standard (~12h)"
+        "--days", type=int, default=7, help="days to keep the restored copy (default 7)"
     )
-    thaw.add_argument("--days", type=int, default=7, help="days to keep the restored copy (default 7)")
 
     ls = sub.add_parser("ls", parents=[common], help="list objects")
     ls.add_argument("prefix", nargs="?", default="")
-    ls.add_argument("-l", "--long", action="store_true", help="long format with class + state")
+    ls.add_argument("-l", "--long", action="store_true", help="long format showing class and state")
     ls.add_argument("--search", metavar="TERM", help="only keys containing TERM")
     ls.add_argument(
         "--state",
@@ -82,14 +78,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="only objects in this state (HEADs archived objects to refine)",
     )
 
-    stat = sub.add_parser("stat", parents=[common], help="show detailed status of objects (globs allowed)")
+    stat = sub.add_parser(
+        "stat", parents=[common], help="show detailed status of objects (globs allowed)"
+    )
     stat.add_argument("keys", nargs="+")
 
     _build_profile_parser(sub, common, class_help)
     return p
 
 
-def _build_profile_parser(sub, common, class_help) -> None:
+def _build_profile_parser(
+    sub: argparse._SubParsersAction,
+    common: argparse.ArgumentParser,
+    class_help: str,
+):
     pf = sub.add_parser("profile", parents=[common], help="manage saved profiles")
     ps = pf.add_subparsers(dest="pcmd")
 
@@ -97,11 +99,17 @@ def _build_profile_parser(sub, common, class_help) -> None:
     add.add_argument("name")
     add.add_argument("--bucket", required=True)
     add.add_argument("--region")
-    add.add_argument("-c", "--class", dest="storage_class", metavar="CLASS", help="default upload " + class_help)
+    add.add_argument(
+        "-c", "--class", dest="storage_class", metavar="CLASS", help="default upload " + class_help
+    )
     add.add_argument("--access-key", dest="access_key_id")
     add.add_argument("--secret", dest="secret_access_key")
-    add.add_argument("--rclone-remote", dest="rclone_remote", help="rclone remote to read credentials from")
-    add.add_argument("--endpoint-url", dest="endpoint_url", help="custom S3 endpoint (for S3-compatible storage)")
+    add.add_argument(
+        "--rclone-remote", dest="rclone_remote", help="rclone remote to read credentials from"
+    )
+    add.add_argument(
+        "--endpoint-url", dest="endpoint_url", help="custom S3 endpoint (for S3-compatible storage)"
+    )
     add.add_argument("--default", action="store_true", help="make this the default profile")
 
     ps.add_parser("ls", parents=[common], help="list saved profiles")
@@ -116,19 +124,16 @@ def _build_profile_parser(sub, common, class_help) -> None:
     show.add_argument("name", nargs="?")
 
 
-# --------------------------------------------------------------------------- #
-# helpers
-# --------------------------------------------------------------------------- #
-def _profile_arg(args) -> str | None:
+def _profile_arg(args: argparse.Namespace) -> str | None:
     return getattr(args, "profile", None)
 
 
-def _open_service(config: Config, args, *, validate: bool = True) -> Service:
+def _open_service(config: Config, args: argparse.Namespace, *, validate: bool = True):
     profile = config.resolve(_profile_arg(args))
     if profile is None or not profile.bucket:
-        raise ArchyError(
-            "no profile configured — add one with "
-            "'archy profile add NAME --bucket BUCKET ...', or pass --profile."
+        raise BuckletError(
+            "no profile configured. add one with "
+            "'bucklet profile add NAME --bucket BUCKET ...', or pass --profile."
         )
     return Service.open(profile, validate=validate)
 
@@ -141,21 +146,18 @@ class _Progress:
         self.size = max(size, 1)
         self.sent = 0
 
-    def __call__(self, n: int) -> None:
+    def __call__(self, n: int):
         self.sent += n
         pct = min(100, self.sent * 100 // self.size)
         sys.stderr.write(f"\r    {self.label} {pct:3d}%")
         sys.stderr.flush()
 
-    def done(self, message: str) -> None:
+    def done(self, message: str):
         sys.stderr.write(f"\r    {message}{' ' * 8}\n")
         sys.stderr.flush()
 
 
-# --------------------------------------------------------------------------- #
-# command handlers
-# --------------------------------------------------------------------------- #
-def cmd_up(config: Config, args) -> int:
+def cmd_up(config: Config, args: argparse.Namespace):
     service = _open_service(config, args)
     plan = service.plan_upload(args.paths, prefix=args.prefix)
     if not plan:
@@ -170,19 +172,19 @@ def cmd_up(config: Config, args) -> int:
         try:
             service.upload(local, key, storage_class=args.storage_class, progress=progress)
             progress.done("done")
-        except ArchyError as exc:
+        except BuckletError as exc:
             progress.done(f"error: {exc}")
             rc = 1
     return rc
 
 
-def cmd_get(config: Config, args) -> int:
+def cmd_get(config: Config, args: argparse.Namespace):
     service = _open_service(config, args)
     resolution = service.resolve_keys(args.keys)
     for miss in resolution.missing:
         sys.stderr.write(f"no match: {miss}\n")
     if not resolution.matched:
-        raise ArchyError("no matching objects.")
+        raise BuckletError("no matching objects.")
     outdir = Path(args.outdir)
     rc = 0
     for key in resolution.matched:
@@ -190,32 +192,32 @@ def cmd_get(config: Config, args) -> int:
         try:
             service.download(key, dest)
             print(f"ok   {key} -> {dest}")
-        except ArchyError as exc:
-            print(f"ERR  {key} — {exc}")
+        except BuckletError as exc:
+            print(f"ERR  {key}: {exc}")
             rc = 1
     return rc
 
 
-def cmd_thaw(config: Config, args) -> int:
+def cmd_thaw(config: Config, args: argparse.Namespace):
     service = _open_service(config, args)
     tier = "Standard" if args.standard else args.tier
     resolution = service.resolve_keys(args.keys)
     for miss in resolution.missing:
         sys.stderr.write(f"no match: {miss}\n")
     if not resolution.matched:
-        raise ArchyError("no matching objects.")
+        raise BuckletError("no matching objects.")
     rc = 0
     for key in resolution.matched:
         try:
             message = service.restore(key, tier=tier, days=args.days)
-            print(f"ok   {key} — {message}")
-        except ArchyError as exc:
-            print(f"ERR  {key} — {exc}")
+            print(f"ok   {key}: {message}")
+        except BuckletError as exc:
+            print(f"ERR  {key}: {exc}")
             rc = 1
     return rc
 
 
-def cmd_ls(config: Config, args) -> int:
+def cmd_ls(config: Config, args: argparse.Namespace):
     service = _open_service(config, args)
     objects = service.list_objects(args.prefix or "")
     if args.search:
@@ -224,9 +226,9 @@ def cmd_ls(config: Config, args) -> int:
 
     states: dict[str, str] = {}
     if args.state:
-        # Resolve states: a listing never carries the Restore header, so any
-        # object that could be archived/restoring needs a HEAD; the rest are
-        # known to be 'available' straight from the listing.
+        # A listing never carries the Restore header, so any object that could be
+        # archived or restoring needs a HEAD; the rest are known to be available
+        # straight from the listing.
         for o in objects:
             if (o.storage_class or "").upper() in storage.RESTORABLE_CLASSES:
                 states[o.key] = service.status(o.key).state
@@ -252,13 +254,13 @@ def cmd_ls(config: Config, args) -> int:
     return 0
 
 
-def cmd_stat(config: Config, args) -> int:
+def cmd_stat(config: Config, args: argparse.Namespace):
     service = _open_service(config, args)
     resolution = service.resolve_keys(args.keys)
     for miss in resolution.missing:
         sys.stderr.write(f"no match: {miss}\n")
     if not resolution.matched:
-        raise ArchyError("no matching objects.")
+        raise BuckletError("no matching objects.")
     for key in resolution.matched:
         st = service.status(key)
         print(key)
@@ -271,11 +273,11 @@ def cmd_stat(config: Config, args) -> int:
         if st.restore_expiry:
             print(f"  restored : until {st.restore_expiry}")
         if storage.can_thaw(st.state):
-            print("  note     : archived — run 'archy thaw' before downloading")
+            print("  note     : archived; run 'bucklet thaw' before downloading")
     return 0
 
 
-def cmd_profile(config: Config, args) -> int:
+def cmd_profile(config: Config, args: argparse.Namespace):
     pcmd = getattr(args, "pcmd", None)
     if pcmd == "add":
         return _profile_add(config, args)
@@ -293,10 +295,10 @@ def cmd_profile(config: Config, args) -> int:
         return 0
     if pcmd == "show":
         return _profile_show(config, args)
-    raise ArchyError("usage: archy profile {add|ls|rm|default|show} ...")
+    raise BuckletError("usage: bucklet profile {add|ls|rm|default|show} ...")
 
 
-def _profile_add(config: Config, args) -> int:
+def _profile_add(config: Config, args: argparse.Namespace):
     cls = storage.DEFAULT_STORAGE_CLASS
     if args.storage_class:
         cls = storage.normalize_storage_class(args.storage_class)
@@ -317,29 +319,32 @@ def _profile_add(config: Config, args) -> int:
     return 0
 
 
-def _profile_ls(config: Config) -> int:
+def _profile_ls(config: Config):
     if not config.profiles:
-        print("no profiles. Add one:  archy profile add NAME --bucket BUCKET [--class CLASS] ...")
+        print("no profiles. add one:  bucklet profile add NAME --bucket BUCKET [--class CLASS] ...")
         return 0
     for name in config.names():
         prof = config.get(name)
         marker = "*" if config.default == name else " "
+        bucket = prof.bucket or "?"
+        region = prof.region or "?"
         print(
-            f"{marker} {name:<16} {(prof.bucket or '?'):<40} "
-            f"{(prof.region or '?'):<15} {prof.storage_class.lower():<14} [{prof.credential_source}]"
+            f"{marker} {name:<16} {bucket:<40} {region:<15} "
+            f"{prof.storage_class.lower():<14} [{prof.credential_source}]"
         )
     return 0
 
 
-def _profile_show(config: Config, args) -> int:
+def _profile_show(config: Config, args: argparse.Namespace):
     profile = config.resolve(args.name)
     if profile is None:
-        raise ArchyError("no such profile (and no default set)")
+        raise BuckletError("no such profile (and no default set)")
     archival = storage.needs_restore(profile.storage_class)
+    note = "  [uploads are archived, need thaw]" if archival else ""
     print(f"profile  : {profile.name}")
     print(f"bucket   : {profile.bucket or '?'}")
     print(f"region   : {profile.region or '(default)'}")
-    print(f"class    : {profile.storage_class}" + ("  [uploads are archived — need thaw]" if archival else ""))
+    print(f"class    : {profile.storage_class}{note}")
     if profile.endpoint_url:
         print(f"endpoint : {profile.endpoint_url}")
     print(f"creds    : {profile.credential_source}")
@@ -359,10 +364,7 @@ _HANDLERS = {
 }
 
 
-# --------------------------------------------------------------------------- #
-# entry point
-# --------------------------------------------------------------------------- #
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
     try:
         config = Config.load()
@@ -372,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
             run_tui(config, _profile_arg(args))
             return 0
         return _HANDLERS[args.cmd](config, args)
-    except ArchyError as exc:
+    except BuckletError as exc:
         sys.stderr.write(f"{PROG}: {exc}\n")
         return 1
     except KeyboardInterrupt:

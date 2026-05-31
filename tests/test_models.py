@@ -2,8 +2,8 @@
 
 from datetime import datetime
 
-from archy import storage
-from archy.models import ObjectInfo, ObjectStatus, Profile
+from bucklet import storage
+from bucklet.models import ObjectInfo, ObjectStatus, Profile
 
 
 def test_credential_source():
@@ -35,8 +35,11 @@ def test_object_status_helpers():
     assert not cold.can_download
 
     ready = ObjectStatus(
-        key="k", state=storage.THAWED, storage_class="DEEP_ARCHIVE",
-        size=10, last_modified=datetime.now(),
+        key="k",
+        state=storage.THAWED,
+        storage_class="DEEP_ARCHIVE",
+        size=10,
+        last_modified=datetime.now(),
     )
     assert ready.can_download
     assert not ready.can_thaw

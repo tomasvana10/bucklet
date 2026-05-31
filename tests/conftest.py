@@ -1,8 +1,8 @@
 """Shared fixtures.
 
 Two kinds of isolation:
-  * ``config_dir`` points HOME and $ARCHY_CONFIG_DIR at a tmp dir, so config,
-    rclone and legacy-deeparch lookups never touch the real machine.
+  * ``config_dir`` points HOME and ``$BUCKLET_CONFIG_DIR`` at a tmp dir, so the
+    config and rclone lookups never touch the real machine.
   * ``s3_client`` / ``make_service`` run inside moto's ``mock_aws`` with fake
     credentials, so nothing hits real AWS.
 """
@@ -11,19 +11,19 @@ from __future__ import annotations
 
 import pytest
 
-from archy.models import Profile
-from archy.service import Service
+from bucklet.models import Profile
+from bucklet.service import Service
 
 
 @pytest.fixture
 def config_dir(tmp_path, monkeypatch):
-    """Isolate HOME + the archy config dir under tmp_path."""
+    """Isolate HOME and the bucklet config dir under tmp_path."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("AWS_REGION", raising=False)
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     monkeypatch.delenv("RCLONE_CONFIG", raising=False)
-    cfg = tmp_path / ".config" / "archy"
-    monkeypatch.setenv("ARCHY_CONFIG_DIR", str(cfg))
+    cfg = tmp_path / ".config" / "bucklet"
+    monkeypatch.setenv("BUCKLET_CONFIG_DIR", str(cfg))
     return cfg
 
 
@@ -48,7 +48,7 @@ def s3_client(aws_env):
 
 @pytest.fixture
 def make_service(s3_client):
-    def _make(bucket="test-bucket", *, storage_class="STANDARD", create=True) -> Service:
+    def _make(bucket: str = "test-bucket", *, storage_class: str = "STANDARD", create: bool = True):
         if create:
             s3_client.create_bucket(Bucket=bucket)
         profile = Profile(
