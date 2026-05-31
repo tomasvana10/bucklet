@@ -14,6 +14,7 @@ classifiers = [
     "Topic :: System :: Archiving :: Backup",
 ]
 dependencies = [
+    "argcomplete>=3.6.3",
     "boto3>=1.43.18",
     "platformdirs>=4.10.0",
     "textual>=8.2.7",

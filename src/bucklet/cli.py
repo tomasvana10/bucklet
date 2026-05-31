@@ -6,6 +6,7 @@ with no subcommand launches the Textual TUI. The CLI is a complete superset of
 the TUI: anything you can do interactively you can script here.
 """
 
+# PYTHON_ARGCOMPLETE_OK
 from __future__ import annotations
 
 import argparse
@@ -19,7 +20,37 @@ from .formatting import fmt_date, human
 from .models import Profile
 from .service import Service
 
+try:
+    import argcomplete
+    from argcomplete.completers import DirectoriesCompleter, FilesCompleter
+
+    _FILES = FilesCompleter()
+    _DIRS = DirectoriesCompleter()
+except ImportError:  # tab completion is optional; the CLI works fine without it
+    argcomplete = None
+    _FILES = _DIRS = None
+
 PROG = "bucklet"
+
+
+def _set_completer(action, completer):
+    """Attach a tab-completion source to an argparse action, if argcomplete is installed."""
+    if argcomplete is not None and completer is not None:
+        action.completer = completer
+    return action
+
+
+def _class_completer(**_):
+    """Complete --class with the canonical storage classes and their aliases."""
+    return [c.lower() for c in storage.STORAGE_CLASSES] + [a.lower() for a in storage._ALIASES]
+
+
+def _profile_completer(**_):
+    """Complete --profile with saved profile names (read from the config, no network)."""
+    try:
+        return Config.load().names()
+    except Exception:
+        return []
 
 
 def build_parser():
@@ -27,12 +58,15 @@ def build_parser():
     # in either position. SUPPRESS keeps a subparser default from clobbering a
     # value given before the subcommand.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--profile",
-        metavar="NAME",
-        default=argparse.SUPPRESS,
-        help="profile to use (a saved name, or a raw bucket name); "
-        "defaults to the configured default profile",
+    _set_completer(
+        common.add_argument(
+            "--profile",
+            metavar="NAME",
+            default=argparse.SUPPRESS,
+            help="profile to use (a saved name, or a raw bucket name); "
+            "defaults to the configured default profile",
+        ),
+        _profile_completer,
     )
 
     class_list = ", ".join(c.lower() for c in storage.STORAGE_CLASSES)
@@ -47,13 +81,19 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd")
 
     up = sub.add_parser("up", parents=[common], help="upload files/dirs (mirrors absolute path)")
-    up.add_argument("paths", nargs="+")
-    up.add_argument("-c", "--class", dest="storage_class", metavar="CLASS", help=class_help)
+    _set_completer(up.add_argument("paths", nargs="+"), _FILES)
+    _set_completer(
+        up.add_argument("-c", "--class", dest="storage_class", metavar="CLASS", help=class_help),
+        _class_completer,
+    )
     up.add_argument("--prefix", default="", help="key prefix to store objects under")
 
     get = sub.add_parser("get", parents=[common], help="download objects (globs allowed)")
     get.add_argument("keys", nargs="+")
-    get.add_argument("-o", "--outdir", default=".", help="output directory (default .)")
+    _set_completer(
+        get.add_argument("-o", "--outdir", default=".", help="output directory (default .)"),
+        _DIRS,
+    )
 
     thaw = sub.add_parser("thaw", parents=[common], help="restore archived objects (globs allowed)")
     thaw.add_argument("keys", nargs="+")
@@ -99,8 +139,15 @@ def _build_profile_parser(
     add.add_argument("name")
     add.add_argument("--bucket", required=True)
     add.add_argument("--region")
-    add.add_argument(
-        "-c", "--class", dest="storage_class", metavar="CLASS", help="default upload " + class_help
+    _set_completer(
+        add.add_argument(
+            "-c",
+            "--class",
+            dest="storage_class",
+            metavar="CLASS",
+            help="default upload " + class_help,
+        ),
+        _class_completer,
     )
     add.add_argument("--access-key", dest="access_key_id")
     add.add_argument("--secret", dest="secret_access_key")
@@ -365,7 +412,10 @@ _HANDLERS = {
 
 
 def main(argv: list[str] | None = None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    if argcomplete is not None:
+        argcomplete.autocomplete(parser)
+    args = parser.parse_args(argv)
     try:
         config = Config.load()
         if args.cmd is None:

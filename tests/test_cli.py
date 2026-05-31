@@ -232,3 +232,18 @@ def test_profile_flag_after_profile_subcommand(config_dir, capsys):
     main(["profile", "add", "p", "--bucket", "b"])
     capsys.readouterr()
     assert main(["profile", "ls", "--profile", "p"]) == 0  # must not argparse-exit(2)
+
+
+def test_class_completer_includes_aliases():
+    from bucklet.cli import _class_completer
+
+    out = _class_completer()
+    assert "deep_archive" in out  # canonical
+    assert "da" in out  # alias
+
+
+def test_profile_completer_lists_saved(config_dir):
+    from bucklet.cli import _profile_completer
+
+    main(["profile", "add", "p", "--bucket", "b"])
+    assert "p" in _profile_completer()
