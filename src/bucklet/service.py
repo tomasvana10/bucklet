@@ -69,14 +69,14 @@ class Service:
         """
         status = self.status(key)
         if status.state == storage.ERROR:
-            raise BuckletError(f"{key}: {status.error}")
+            raise BuckletError(status.error or "could not read its status")
         if status.state == storage.AVAILABLE:
             return f"already available ({status.storage_class.lower()}), no thaw needed"
         if status.state == storage.THAWING:
-            return "restore already in progress"
+            return "thaw already in progress"
         if status.state == storage.THAWED:
             until = f" (until {status.restore_expiry})" if status.restore_expiry else ""
-            return f"already restored{until}"
+            return f"already thawed{until}"
         return s3.restore_object(self.client, self.bucket, key, tier=tier, days=days)
 
     def download(self, key: str, dest: Path, progress: ProgressCB | None = None):
@@ -119,19 +119,19 @@ class Service:
             raise BuckletError(f"an object named {new_key!r} already exists")
         status = self.status(old_key)
         if status.state == storage.ERROR:
-            raise BuckletError(f"{old_key}: {status.error}")
+            raise BuckletError(f"couldn't read {old_key}: {status.error}")
         # The copy reads the source's bytes, so anything not downloadable can't be
         # renamed yet. Tell a still-thawing object apart from a cold one, so the
         # advice fits: "wait" vs "thaw it" (a copy of either would hit
         # InvalidObjectState with the same unhelpful message).
         if not storage.can_download(status.state):
             if status.state == storage.THAWING:
-                raise BuckletError(f"{old_key} is being thawed; wait for it to finish first")
-            raise BuckletError(f"{old_key} is archived; thaw it before renaming")
+                raise BuckletError(f"{old_key} is being thawed, wait for it to finish")
+            raise BuckletError(f"{old_key} is archived, you must thaw it first")
         if not s3.can_delete(self.client, self.bucket, old_key):
             raise BuckletError(
-                "can't rename: this profile can't delete the original "
-                "(needs s3:DeleteObject), so the rename would leave a duplicate"
+                "this profile can't delete the original, so renaming would leave "
+                "a duplicate (it needs the s3:DeleteObject permission)"
             )
         s3.copy_object(self.client, self.bucket, old_key, new_key, status.storage_class)
         try:
@@ -143,7 +143,9 @@ class Service:
                 s3.delete_object(self.client, self.bucket, new_key)
             except BuckletError:
                 pass  # nothing more we can do; the original message matters most
-            raise BuckletError(f"copied, but couldn't remove the original: {exc}") from exc
+            raise BuckletError(
+                f"copied the new object, but couldn't remove the original: {exc}"
+            ) from exc
         return f"renamed {old_key} -> {new_key}"
 
     def resolve_storage_class(self, storage_class: str | None):

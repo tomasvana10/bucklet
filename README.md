@@ -46,7 +46,7 @@ positional arguments:
   {up,get,thaw,ls,stat,profile}
     up                  upload files/dirs (mirrors absolute path)
     get                 download objects (globs allowed)
-    thaw                restore archived objects (globs allowed)
+    thaw                thaw archived objects (globs allowed)
     ls                  list objects
     stat                show detailed status of objects (globs allowed)
     profile             manage saved profiles

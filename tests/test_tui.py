@@ -68,7 +68,7 @@ class FakeService:
 
     def restore(self, key: str, *, tier: str = "Bulk", days: int = 7):
         self.restored.append((key, tier, days))
-        return "restore requested"
+        return "thaw requested"
 
     def download(self, key: str, dest: Path, progress: Callable[[int], None] | None = None):
         self.downloaded.append(key)
@@ -534,7 +534,7 @@ async def test_actions_safe_on_empty_listing(tmp_path):
 # --- footer: divider + greying object actions -------------------------------
 
 
-async def test_footer_has_divider(tmp_path):
+async def test_footer_has_dividers_and_profile_label(tmp_path):
     from textual.widgets import Static
 
     from bucklet.tui.app import BuckletFooter
@@ -544,8 +544,34 @@ async def test_footer_has_divider(tmp_path):
         await app.workers.wait_for_complete()
         await pilot.pause()
         footer = app.query_one(BuckletFooter)
+        # Four sections (objects │ view │ bucket-wide │ profile) → three dividers.
         dividers = [w for w in footer.query(Static) if "footer-divider" in w.classes]
-        assert len(dividers) == 1
+        assert len(dividers) == 3
+        # The profile section is prefixed with a muted "Profile" label.
+        labels = [w for w in footer.query(Static) if "footer-group-label" in w.classes]
+        assert any("Profile" in str(w.render()) for w in labels)
+
+
+async def test_footer_view_key_shows_active_view_icon(tmp_path):
+    from textual.widgets._footer import FooterKey
+
+    from bucklet.tui.app import BuckletFooter
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        footer = app.query_one(BuckletFooter)
+
+        def view_desc():
+            return next(k.description for k in footer.query(FooterKey) if k.action == "view")
+
+        assert "≡" in view_desc()  # flat view is the default
+        await pilot.press("v")
+        await pilot.pause()
+        await pilot.pause()
+        assert app.view_mode == "tree"
+        assert "├" in view_desc()
 
 
 async def test_object_actions_greyed_when_empty(tmp_path):
@@ -952,6 +978,28 @@ async def test_rename_error_keeps_object(tmp_path):
         assert _has_message(app, "already exists", "error")
 
 
+async def test_rename_error_does_not_double_the_key(tmp_path):
+    # Service.rename messages already name the object, so the worker shows them
+    # as-is. The old code prepended the key, doubling it into the eyesore
+    # "doc.txt: doc.txt is archived…". Drive a key-bearing error and check once.
+    fake = FakeService()
+    fake.rename_error = "doc.txt is archived, you must thaw it first"
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # doc.txt
+        await pilot.press("e")
+        await pilot.pause()
+        app.screen.query_one("#value", Input).value = "warm.txt"
+        app.screen.query_one("#ok", Button).press()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        msg = next(text for text, _ in _messages(app) if "archived" in text)
+        assert msg == "doc.txt is archived, you must thaw it first"
+        assert msg.count("doc.txt") == 1
+
+
 # --- tree (folder) view -----------------------------------------------------
 
 
@@ -1163,3 +1211,27 @@ async def test_add_profile_custom_endpoint_saves(tmp_path):
         assert stored.endpoint_url == "https://minio.example"
         assert stored.is_aws is False
         assert stored.access_key_id is None and stored.rclone_remote is None
+        # region was left blank: a custom endpoint defaults it to "auto" so
+        # botocore can still sign (what R2 wants), keeping the field truly optional.
+        assert stored.region == "auto"
+
+
+async def test_add_profile_custom_endpoint_keeps_explicit_region(tmp_path):
+    cfg = Config(tmp_path / "config.json")
+    app = BuckletApp(config=cfg, service=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#name", Input).value = "wasabi"
+        screen.query_one("#bucket", Input).value = "bkt"
+        _select_radio(screen, "conn", 1)  # custom
+        _select_radio(screen, "creds", 2)  # env / IAM role
+        await pilot.pause()
+        screen.query_one("#endpoint", Input).value = "https://s3.wasabisys.com"
+        screen.query_one("#region", Input).value = "us-east-2"
+        screen.query_one("#ok", Button).press()
+        await pilot.pause()
+        # an explicit region is preserved, not clobbered by the "auto" default
+        assert cfg.get("wasabi").region == "us-east-2"

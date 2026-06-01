@@ -112,7 +112,7 @@ def test_restore_moves_off_cold(s3_client, tmp_path):
     assert s3.head_status(client, "the-bucket", "k").state == storage.COLD
 
     message = s3.restore_object(client, "the-bucket", "k", tier="Bulk", days=3)
-    assert "restore" in message.lower()
+    assert "thaw" in message.lower()
     assert s3.head_status(client, "the-bucket", "k").state != storage.COLD
 
 

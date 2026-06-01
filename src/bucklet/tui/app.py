@@ -49,8 +49,22 @@ COL_STATE, COL_SIZE, COL_MOD, COL_CLASS, COL_KEY = "state", "size", "mod", "clas
 
 _FILTER_CYCLE = [None, storage.COLD, storage.THAWING, storage.THAWED, storage.AVAILABLE]
 
+# Footer layout: actions grouped into sections, drawn left to right with a thin
+# vertical divider between groups. The view toggle gets its own section, and the
+# profile group is prefixed with a muted "Profile" label. Anything not listed here
+# (e.g. the command palette key) sits outside the grouping and draws no divider.
+_FOOTER_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("detail", "rename", "thaw", "advanced_thaw", "download", "delete"),
+    ("view",),
+    ("upload", "search", "filter", "refresh", "quit"),
+    ("switch_profile", "add_profile", "settings"),
+)
+_FOOTER_GROUP_OF = {action: i for i, group in enumerate(_FOOTER_GROUPS) for action in group}
+_FOOTER_PROFILE_GROUP = 3  # the group prefixed with a muted "Profile" label
+
 # Actions that operate on the selected object; greyed out when nothing is listed.
-_OBJECT_ACTIONS = frozenset({"detail", "rename", "thaw", "advanced_thaw", "download", "delete"})
+# These are exactly the first footer group.
+_OBJECT_ACTIONS = frozenset(_FOOTER_GROUPS[0])
 
 # Actions that only make sense on a genuine AWS bucket (storage classes / restores);
 # hidden entirely for a custom S3-compatible profile, where everything is available.
@@ -62,11 +76,12 @@ THAW_CONFIRM_BYTES = 100 * 1024 * 1024
 
 
 class BuckletFooter(Footer):
-    """The standard footer, with a divider after the object-specific keys.
+    """The standard footer, split into sections by thin vertical dividers.
 
     Textual's footer has no notion of sections, so we let it build its keys and
-    then slot a thin divider in after the last object action (Info/Thaw/Get/
-    Delete), separating them from the bucket-wide actions that follow.
+    then walk them, dropping a divider in wherever the action moves to the next
+    group in ``_FOOTER_GROUPS``. The profile group is prefixed with a muted
+    "Profile" label, and the View key shows an icon for the active view.
     """
 
     DEFAULT_CSS = """
@@ -75,18 +90,31 @@ class BuckletFooter(Footer):
         color: $foreground 40%;
         background: $footer-item-background;
     }
+    BuckletFooter .footer-group-label {
+        width: auto;
+        color: $text-muted;
+        background: $footer-item-background;
+        padding: 0 1;
+    }
     """
 
     def compose(self) -> ComposeResult:
-        widgets = list(super().compose())
-        last_object_key = -1
-        for i, widget in enumerate(widgets):
+        prev_group: int | None = None
+        for widget in super().compose():
             action = getattr(widget, "action", None)
-            if action and action.split("(", 1)[0] in _OBJECT_ACTIONS:
-                last_object_key = i
-        if 0 <= last_object_key < len(widgets) - 1:
-            widgets.insert(last_object_key + 1, Static("│", classes="footer-divider"))
-        yield from widgets
+            base = action.split("(", 1)[0] if action else None
+            group = _FOOTER_GROUP_OF.get(base)
+            if group is not None and group != prev_group:
+                if prev_group is not None:
+                    yield Static("│", classes="footer-divider")
+                if group == _FOOTER_PROFILE_GROUP:
+                    yield Static("Profile", classes="footer-group-label")
+                prev_group = group
+            if base == "view":
+                # The icon reflects the active view: ≡ flat (rows), ├ tree (folders).
+                tree = getattr(self.app, "view_mode", "flat") == "tree"
+                widget.description = f"{'├' if tree else '≡'} View"
+            yield widget
 
 
 # severity -> the CSS class that colours a message line.
@@ -229,6 +257,10 @@ class BuckletApp(App):
     #dialog Select, #dialog SelectCurrent { height: 1; border: none; }
     #dialog SelectCurrent { background: $boost; }
     #dialog Checkbox { height: 1; border: none; padding: 0; background: transparent; }
+    /* The field-group wrappers (#class-row, #endpoint-row, …) are plain Vertical
+       containers, which default to height: 1fr and would collapse to nothing
+       inside the auto-height dialog, taking their fields with them. */
+    #dialog Vertical { height: auto; }
     #dialog .segmented { height: auto; border: none; padding: 0; margin-bottom: 1; }
     #dialog .segmented RadioButton { border: none; padding: 0; background: transparent; }
     .dialog-title { text-style: bold; color: $secondary; margin-bottom: 1; }
@@ -239,7 +271,7 @@ class BuckletApp(App):
 
     BINDINGS = [
         # Object-specific actions (greyed out when nothing is listed; see
-        # check_action). The footer draws a divider after this group.
+        # check_action). Footer group 0.
         Binding("i", "detail", "Info"),
         Binding("e", "rename", "Rename"),
         Binding("t", "thaw('Bulk')", "Thaw"),
@@ -247,16 +279,19 @@ class BuckletApp(App):
         Binding("g", "download", "Get"),
         # Only shown/active when launched with --allow-deletion; see check_action.
         Binding("d", "delete", "Delete"),
+        # The view toggle gets its own footer section; the footer puts an icon on
+        # this label to show whether the flat or tree view is live.
+        Binding("v", "view", "View"),
         # Bucket-/app-wide actions.
         Binding("u", "upload", "Upload"),
-        Binding("v", "view", "View"),
-        Binding("s", "settings", "Settings"),
-        Binding("r", "refresh", "Refresh"),
         Binding("slash", "search", "Search"),
         Binding("f", "filter", "Filter"),
-        Binding("p", "switch_profile", "Profile"),
-        Binding("a", "add_profile", "Add"),
+        Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
+        # Profile management: its own footer section, labelled "Profile".
+        Binding("p", "switch_profile", "Show"),
+        Binding("a", "add_profile", "Add"),
+        Binding("s", "settings", "Settings"),
         # Ctrl+C quits too, instead of nagging the user to press Ctrl+Q.
         Binding("ctrl+c", "quit", show=False, priority=True),
     ]
@@ -656,9 +691,9 @@ class BuckletApp(App):
             lines.append(f"class    : {status.storage_class if status else obj.storage_class}")
             lines.append(f"state    : {state}")
             if status and status.restore_expiry:
-                lines.append(f"restored : until {status.restore_expiry}")
+                lines.append(f"thawed   : until {status.restore_expiry}")
             if storage.can_thaw(state):
-                lines += ["", "archived. press t (quick) or T (advanced) to restore"]
+                lines += ["", "archived. press t (quick) or T (advanced) to thaw"]
             elif storage.can_download(state):
                 lines += ["", "press g to download"]
         else:
@@ -733,7 +768,7 @@ class BuckletApp(App):
     def _thaw_worker(self, key: str, tier: str, days: int):
         service = self.service
         self.call_from_thread(
-            self.flash, f"requesting {tier} restore ({days}d): {key}…", key="op", timeout=10.0
+            self.flash, f"requesting {tier} thaw ({days}d): {key}…", key="op", timeout=10.0
         )
         try:
             message = service.restore(key, tier=tier, days=days)
@@ -855,9 +890,9 @@ class BuckletApp(App):
         try:
             message = service.rename(old_key, new_key)
         except BuckletError as exc:
-            self.call_from_thread(
-                self.flash, f"{old_key}: {exc}", severity="error", timeout=8.0, key="op"
-            )
+            # The service messages already name the object where it helps, so we
+            # don't prepend the key here (that's what doubled it: "k: k is …").
+            self.call_from_thread(self.flash, str(exc), severity="error", timeout=8.0, key="op")
             return
         self.call_from_thread(self._rename_object, old_key, new_key)
         self.call_from_thread(self.flash, message, key="op")

@@ -260,8 +260,8 @@ class AddProfileScreen(ModalScreen[dict | None]):
             yield Input(id="name", placeholder="my-bucket")
             yield Label("bucket")
             yield Input(id="bucket", placeholder="s3 bucket name")
-            yield Label("region")
-            yield Input(id="region", placeholder="e.g. ap-southeast-2")
+            yield Label("region (optional)")
+            yield Input(id="region", placeholder="e.g. ap-southeast-2, or auto for R2")
 
             yield Label("connection")
             with RadioSet(id="conn", classes="segmented"):
@@ -331,6 +331,7 @@ class AddProfileScreen(ModalScreen[dict | None]):
         if not name or not bucket:
             self.notify("name and bucket are required", severity="error")
             return
+        region = self.query_one("#region", Input).value.strip() or None
         endpoint = None
         storage_class = storage.DEFAULT_STORAGE_CLASS
         if self._is_aws():
@@ -340,6 +341,9 @@ class AddProfileScreen(ModalScreen[dict | None]):
             if not endpoint:
                 self.notify("a custom endpoint url is required", severity="error")
                 return
+            # botocore needs a region to sign even against a custom endpoint;
+            # "auto" is what R2 wants and most others tolerate, so blank is fine.
+            region = region or "auto"
         access_key = secret = rclone = None
         creds = self._creds_index()
         if creds == 0:
@@ -354,7 +358,7 @@ class AddProfileScreen(ModalScreen[dict | None]):
             {
                 "name": name,
                 "bucket": bucket,
-                "region": self.query_one("#region", Input).value.strip() or None,
+                "region": region,
                 "storage_class": storage_class,
                 "rclone_remote": rclone,
                 "access_key_id": access_key,
@@ -397,7 +401,7 @@ class UploadScreen(ModalScreen[dict | None]):
                 )
             yield Label("key prefix (optional)")
             yield Input(id="prefix")
-            yield Checkbox("key by name, not full path", id="basename")
+            yield Checkbox("use base name as key", id="basename")
             with Horizontal(classes="buttons"):
                 yield Button("Upload", id="ok", variant="primary")
                 yield Button("Cancel", id="cancel")

@@ -149,11 +149,11 @@ def restore_object(client: BaseClient, bucket: str, key: str, tier: str = "Bulk"
             Key=key,
             RestoreRequest={"Days": days, "GlacierJobParameters": {"Tier": tier}},
         )
-        return f"{tier} restore requested ({days}d)"
+        return f"{tier} thaw requested ({days}d)"
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code == "RestoreAlreadyInProgress":
-            return "restore already in progress"
+            return "thaw already in progress"
         raise BuckletError(_client_error_message(exc)) from exc
 
 
@@ -257,9 +257,11 @@ def copy_object(client: BaseClient, bucket: str, src_key: str, dst_key: str, sto
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code == "InvalidObjectState":
-            raise BuckletError("object is archived; thaw it before renaming") from exc
+            raise BuckletError("the object is archived, you must thaw it first") from exc
         if code == "EntityTooLarge":
-            raise BuckletError("object is larger than 5GB; can't rename it by copy") from exc
+            raise BuckletError(
+                "the object is larger than 5GB, so it can't be renamed by copy"
+            ) from exc
         raise BuckletError(_client_error_message(exc)) from exc
     except BotoCoreError as exc:
         raise BuckletError(str(exc) or "could not copy object") from exc

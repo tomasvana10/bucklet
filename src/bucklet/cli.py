@@ -108,17 +108,17 @@ def build_parser():
         _DIRS,
     )
 
-    thaw = sub.add_parser("thaw", parents=[common], help="restore archived objects (globs allowed)")
+    thaw = sub.add_parser("thaw", parents=[common], help="thaw archived objects (globs allowed)")
     thaw.add_argument("keys", nargs="+")
     thaw.add_argument(
         "--tier",
         choices=["Bulk", "Standard", "Expedited"],
         default="Bulk",
-        help="restore tier (default Bulk, ~48h, cheapest)",
+        help="thaw tier (default Bulk, ~48h, cheapest)",
     )
     thaw.add_argument("--standard", action="store_true", help="shortcut for --tier Standard (~12h)")
     thaw.add_argument(
-        "--days", type=int, default=7, help="days to keep the restored copy (default 7)"
+        "--days", type=int, default=7, help="days to keep the thawed copy (default 7)"
     )
 
     ls = sub.add_parser("ls", parents=[common], help="list objects")

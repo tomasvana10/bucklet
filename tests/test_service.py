@@ -170,7 +170,7 @@ def _force_status(svc: Service, status: ObjectStatus, monkeypatch: pytest.Monkey
 def test_restore_thawing_message(make_service, monkeypatch):
     svc = make_service()
     _force_status(svc, ObjectStatus("k", storage.THAWING, "DEEP_ARCHIVE"), monkeypatch)
-    assert svc.restore("k") == "restore already in progress"
+    assert svc.restore("k") == "thaw already in progress"
 
 
 def test_restore_thawed_message_with_expiry(make_service, monkeypatch):
@@ -182,14 +182,14 @@ def test_restore_thawed_message_with_expiry(make_service, monkeypatch):
         ),
         monkeypatch,
     )
-    assert "already restored (until Fri, 21 Dec 2012 00:00:00 GMT)" in svc.restore("k")
+    assert "already thawed (until Fri, 21 Dec 2012 00:00:00 GMT)" in svc.restore("k")
 
 
 def test_restore_thawed_message_without_expiry(make_service, monkeypatch):
     svc = make_service()
     _force_status(svc, ObjectStatus("k", storage.THAWED, "DEEP_ARCHIVE"), monkeypatch)
     message = svc.restore("k")
-    assert "already restored" in message and "until" not in message
+    assert "already thawed" in message and "until" not in message
 
 
 def test_restore_error_raises(make_service, monkeypatch):
