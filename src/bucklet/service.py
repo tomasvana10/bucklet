@@ -146,7 +146,7 @@ class Service:
             raise BuckletError(
                 f"copied the new object, but couldn't remove the original: {exc}"
             ) from exc
-        return f"renamed {old_key} -> {new_key}"
+        return f"renamed {old_key} to {new_key}"
 
     def resolve_storage_class(self, storage_class: str | None):
         """The class to upload with: an explicit override or the profile default."""

@@ -91,7 +91,7 @@ class FakeService:
             ObjectInfo(new_key, o.size, o.last_modified, o.storage_class) if o.key == old_key else o
             for o in self.objects
         ]
-        return f"renamed {old_key} -> {new_key}"
+        return f"renamed {old_key} to {new_key}"
 
     def plan_upload(self, paths, prefix: str = "", *, basename_key: bool = False):
         self.plan_calls.append(
@@ -566,12 +566,12 @@ async def test_footer_view_key_shows_active_view_icon(tmp_path):
         def view_desc():
             return next(k.description for k in footer.query(FooterKey) if k.action == "view")
 
-        assert "≡" in view_desc()  # flat view is the default
+        assert "Flat" in view_desc()  # flat view is the default
         await pilot.press("v")
         await pilot.pause()
         await pilot.pause()
         assert app.view_mode == "tree"
-        assert "├" in view_desc()
+        assert "Tree" in view_desc()
 
 
 async def test_object_actions_greyed_when_empty(tmp_path):

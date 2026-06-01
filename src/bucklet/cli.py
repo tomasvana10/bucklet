@@ -379,7 +379,7 @@ def cmd_profile(config: Config, args: argparse.Namespace):
     if pcmd == "default":
         config.set_default(args.name)
         config.save()
-        print(f"default -> {args.name}")
+        print(f"default set to {args.name}")
         return 0
     if pcmd == "show":
         return _profile_show(config, args)

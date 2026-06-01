@@ -111,9 +111,8 @@ class BuckletFooter(Footer):
                     yield Static("Profile", classes="footer-group-label")
                 prev_group = group
             if base == "view":
-                # The icon reflects the active view: ≡ flat (rows), ├ tree (folders).
                 tree = getattr(self.app, "view_mode", "flat") == "tree"
-                widget.description = f"{'├' if tree else '≡'} View"
+                widget.description = f"{'Tree' if tree else 'Flat'} View"
             yield widget
 
 
@@ -832,7 +831,7 @@ class BuckletApp(App):
                 self.flash, f"{key}: {exc}", severity="error", timeout=8.0, key="op"
             )
             return
-        self.call_from_thread(self.flash, f"{key}: downloaded -> {dest}", key="op")
+        self.call_from_thread(self.flash, f"{key} downloaded to {dest}", key="op")
 
     def action_delete(self):
         # check_action gates this off the footer, but guard anyway: a stray key
