@@ -95,6 +95,11 @@ def build_parser():
         _class_completer,
     )
     up.add_argument("--prefix", default="", help="key prefix to store objects under")
+    up.add_argument(
+        "--basename-key",
+        action="store_true",
+        help="key each object by its name relative to the path given, not its full absolute path",
+    )
 
     get = sub.add_parser("get", parents=[common], help="download objects (globs allowed)")
     get.add_argument("keys", nargs="+")
@@ -240,7 +245,7 @@ class _UploadProgress:
 
 def cmd_up(config: Config, args: argparse.Namespace):
     service = _open_service(config, args)
-    plan = service.plan_upload(args.paths, prefix=args.prefix)
+    plan = service.plan_upload(args.paths, prefix=args.prefix, basename_key=args.basename_key)
     if not plan:
         print("nothing to upload.")
         return 0

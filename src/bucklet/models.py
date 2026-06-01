@@ -85,6 +85,21 @@ class Profile:
         return bool(self.access_key_id and self.secret_access_key)
 
     @property
+    def is_aws(self) -> bool:
+        """True for genuine AWS S3, i.e. a profile with no custom endpoint.
+
+        A custom S3-compatible endpoint is assumed *not* to offer the archival
+        storage classes or restores that only AWS has, so everything it holds is
+        downloadable straight away. The TUI keys its WYSIWYG behaviour off this:
+        for a non-AWS profile it hides the State and Class columns, the
+        upload storage-class picker, and the thaw actions, since none of them
+        mean anything there. It's exactly the "AWS S3" vs "Custom S3-compatible"
+        choice the add-profile form makes, expressed as the presence of an
+        endpoint URL.
+        """
+        return not self.endpoint_url
+
+    @property
     def tuning(self) -> Tuning:
         """Transfer settings with defaults applied for any unset knob.
 

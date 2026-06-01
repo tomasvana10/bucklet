@@ -10,11 +10,14 @@ can't.
 
 What bucklet does:
 
-- List, upload, download, and inspect objects in a bucket.
+- List, upload, download, inspect, and rename objects in a bucket. The TUI can
+  list either flat or as a collapsed folder tree.
 - Restore ("thaw") archived objects, and only offer that when an object's live
-  storage class actually needs it.
+  storage class actually needs it — quickly, or via a dialog that picks the
+  tier and how long the copy stays thawed.
 - Keep named profiles, each pointing at one bucket with its own credentials and
-  a default upload class.
+  a default upload class. A profile is either AWS or a custom S3-compatible
+  endpoint, and the TUI shows only what that kind supports (see "WYSIWYG").
 
 What it leaves out, on purpose:
 
@@ -34,6 +37,7 @@ The package is a stack. Lower layers know nothing about the ones above them.
 
     bucklet/
       storage.py     storage-class vocabulary and object-state logic (pure)
+      tree.py        builds a collapsed folder tree from object keys (pure)
       models.py      the Profile, ObjectInfo and ObjectStatus dataclasses
       errors.py      the BuckletError exception type
       formatting.py  byte-size and date display helpers
@@ -50,12 +54,13 @@ The package is a stack. Lower layers know nothing about the ones above them.
 
 `service.Service` is where the work happens. It binds a resolved profile to a
 boto3 client and exposes plain methods: `list_objects`, `status`, `restore`,
-`download`, `upload`, `upload_many`, `delete`, `resolve_keys`. The CLI and the
-TUI both call those and only deal with presenting the results. Add a capability
-to the service and both front-ends can use it.
+`download`, `upload`, `upload_many`, `delete`, `rename`, `resolve_keys`. The CLI
+and the TUI both call those and only deal with presenting the results. Add a
+capability to the service and both front-ends can use it.
 
-The one exception is `delete`: the capability lives in the service like the
-rest, but only the TUI surfaces it (see "Deletion"). The CLI never calls it.
+Two are TUI-only. `delete` is the heavily-fenced one (see "Deletion"). `rename`
+lives in the service too but is only surfaced in the TUI (there's no `mv`
+subcommand); see "Renaming" for why it's offered without the deletion fence.
 
 ### The pure layer
 
@@ -135,6 +140,59 @@ screen, because it is still in the bucket. Only a successful delete drops the ro
 (removed locally, with no re-list, so deletion still works on buckets whose
 listing is flaky). S3 deletion is idempotent, so there is no "already gone" case
 to handle.
+
+### Renaming
+
+S3 has no rename, so `Service.rename` is a server-side copy to the new key
+followed by a delete of the old one. It removes a key, but unlike `delete` it is
+offered in the TUI ungated, because it never loses data: the copy always comes
+first, and on any failure the copy is what gets undone.
+
+The order is deliberate, all to avoid the "copied but couldn't delete, now
+there's a duplicate" trap. It refuses up front when the new key is empty, equal,
+or already taken, and when the source is archived (its bytes can't be copied
+until thawed). Then — before copying — it probes delete permission with
+`s3.can_delete`, which deletes a sentinel key that doesn't exist (DeleteObject is
+idempotent, so this succeeds with the permission and 403s without it, touching no
+real data). Only then does it copy and delete. If that final delete still fails
+(an exact-key deny, an object lock the probe couldn't see), it deletes the fresh
+copy to roll back and reports the original cause. The renamed object keeps the
+source's storage class.
+
+### The tree view
+
+The flat `DataTable` is the default; `v` toggles a `Tree` built from the keys by
+the pure `tree.build_key_tree`. It collapses single-child directory chains the
+way GitHub and file browsers do — `x/y/z/file.txt` becomes one folder `x/y/z`,
+not three nested ones — and stops collapsing at the first branch, so structure
+stays legible without a row per prefix level. Keeping the build pure means the
+fiddly compression is unit-tested without a UI.
+
+Search behaves differently per view, by design. Flat-view search filters rows.
+Tree-view search would shred the structure if it filtered, so instead it
+highlights matching leaves and expands their ancestor folders, leaving the rest
+collapsed — every match on screen, nothing else forced open. Status polls relabel
+a single leaf in place (via a key→node map) rather than rebuilding, so expansion
+state survives.
+
+### WYSIWYG: AWS vs custom S3
+
+A profile is "AWS" when it has no custom endpoint (`Profile.is_aws`). The archival
+storage classes, restores, and object states only exist on real AWS, so for a
+custom S3-compatible profile the TUI hides everything that would only ever read
+the same: the State and Class columns, the per-state counts in the bar, the
+thaw actions, and the upload storage-class picker. The add-profile form is the
+source of this — its connection segmented-button decides between an endpoint
+(custom) and a storage class (AWS), so the rest follows from one choice.
+
+### Thawing
+
+`t` is the quick thaw (Bulk tier, default window). `T` opens a dialog to pick the
+tier and how many days the restored copy stays available before S3 lets it lapse
+back to cold. Either way, thawing an object larger than `THAW_CONFIRM_BYTES`
+(100 MiB) first asks for confirmation, since a restore can be slow and, on the
+Expedited tier, costly. The size threshold is one constant, shown to the user
+through `human()` so the prompt and the rule can't drift apart.
 
 ## Configuration
 

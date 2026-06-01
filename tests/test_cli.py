@@ -342,6 +342,21 @@ def test_profile_show_includes_tuning(config_dir, capsys):
     assert "tuning" in out and "parallel uploads" in out and "(default)" in out
 
 
+def test_up_basename_key(config_dir, s3_client, capsys, tmp_path):
+    s3_client.create_bucket(Bucket="cli-bucket")
+    _add_profile("cli-bucket")
+    f = tmp_path / "deep" / "nested" / "doc.txt"
+    f.parent.mkdir(parents=True)
+    f.write_text("hello")
+    capsys.readouterr()
+    # --basename-key stores the object under just its name, not the abs path
+    assert main(["up", str(f), "--basename-key", "--profile", "p"]) == 0
+    assert main(["ls", "--profile", "p"]) == 0
+    out = capsys.readouterr().out
+    assert "doc.txt" in out
+    assert str(f.resolve()).lstrip("/") not in out  # not the mirrored absolute path
+
+
 def test_up_multiple_files(config_dir, s3_client, capsys, tmp_path):
     s3_client.create_bucket(Bucket="cli-bucket")
     _add_profile("cli-bucket")

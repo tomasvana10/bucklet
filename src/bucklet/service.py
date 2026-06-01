@@ -95,6 +95,57 @@ class Service:
         s3.delete_object(self.client, self.bucket, key)
         return f"deleted {key}"
 
+    def rename(self, old_key: str, new_key: str):
+        """Rename an object — a server-side copy to ``new_key`` then a delete
+        of ``old_key`` (S3 has no rename).
+
+        It refuses rather than risk a mess: the new key must be non-empty,
+        different, and not already taken (renaming over a live object would
+        destroy it); the source must be readable, so an archived/cold object is
+        rejected with a thaw-first message (its bytes can't be copied). Crucially
+        it checks delete permission *before* copying, so it never leaves a
+        duplicate it can't clean up; and if the delete fails anyway (an exact-key
+        deny, object lock), it rolls the copy back and reports why. The new
+        object keeps the original's storage class. Unlike ``delete`` this is
+        offered in the TUI without ``--allow-deletion``, because it never loses
+        data — the copy always precedes (and on failure, replaces) the delete.
+        """
+        new_key = new_key.strip().lstrip("/")  # S3 keys don't begin with '/'
+        if not new_key:
+            raise BuckletError("the new key is empty")
+        if new_key == old_key:
+            raise BuckletError("the new key is the same as the old one")
+        if s3.object_exists(self.client, self.bucket, new_key):
+            raise BuckletError(f"an object named {new_key!r} already exists")
+        status = self.status(old_key)
+        if status.state == storage.ERROR:
+            raise BuckletError(f"{old_key}: {status.error}")
+        # The copy reads the source's bytes, so anything not downloadable can't be
+        # renamed yet. Tell a still-thawing object apart from a cold one, so the
+        # advice fits: "wait" vs "thaw it" (a copy of either would hit
+        # InvalidObjectState with the same unhelpful message).
+        if not storage.can_download(status.state):
+            if status.state == storage.THAWING:
+                raise BuckletError(f"{old_key} is being thawed; wait for it to finish first")
+            raise BuckletError(f"{old_key} is archived; thaw it before renaming")
+        if not s3.can_delete(self.client, self.bucket, old_key):
+            raise BuckletError(
+                "can't rename: this profile can't delete the original "
+                "(needs s3:DeleteObject), so the rename would leave a duplicate"
+            )
+        s3.copy_object(self.client, self.bucket, old_key, new_key, status.storage_class)
+        try:
+            s3.delete_object(self.client, self.bucket, old_key)
+        except BuckletError as exc:
+            # The copy landed but the original won't delete after all. Undo the
+            # copy so we don't strand a duplicate, then report the real cause.
+            try:
+                s3.delete_object(self.client, self.bucket, new_key)
+            except BuckletError:
+                pass  # nothing more we can do; the original message matters most
+            raise BuckletError(f"copied, but couldn't remove the original: {exc}") from exc
+        return f"renamed {old_key} -> {new_key}"
+
     def resolve_storage_class(self, storage_class: str | None):
         """The class to upload with: an explicit override or the profile default."""
         if storage_class:
@@ -210,11 +261,18 @@ class Service:
             return list(pool.map(upload_one, plan))
 
     @staticmethod
-    def plan_upload(paths: Iterable[str | os.PathLike], prefix: str = ""):
+    def plan_upload(
+        paths: Iterable[str | os.PathLike], prefix: str = "", *, basename_key: bool = False
+    ):
         """Expand paths into (local_file, key) pairs.
 
-        Keys mirror each file's absolute path with the leading slash stripped,
-        optionally under ``prefix``. Directories are walked recursively.
+        By default keys mirror each file's absolute path with the leading slash
+        stripped (so the bucket reflects where the files live). With
+        ``basename_key`` the key is instead relative to the argument given: a
+        plain file becomes just its name, and a directory keeps its own name and
+        the structure under it (``mydir/sub/f.txt`` rather than the whole
+        ``home/you/.../mydir/sub/f.txt``). A ``prefix`` is prepended in either
+        mode. Directories are walked recursively.
         """
         prefix = prefix.strip("/")
         plan: list[tuple[Path, str]] = []
@@ -222,13 +280,16 @@ class Service:
             real = Path(os.path.realpath(raw))
             if not real.exists():
                 raise BuckletError(f"not found: {raw}")
+            # In basename mode keys are relative to the argument's parent, so a
+            # file is its name and a dir keeps its own name as the top segment.
+            base = real.parent if basename_key else None
             if real.is_dir():
                 for root, _dirs, names in os.walk(real):
                     for name in sorted(names):
                         full = Path(root) / name
-                        plan.append((full, _mirror_key(full, prefix)))
+                        plan.append((full, _key_for(full, base, prefix)))
             else:
-                plan.append((real, _mirror_key(real, prefix)))
+                plan.append((real, _key_for(real, base, prefix)))
         return plan
 
     def resolve_keys(self, patterns: Iterable[str]):
@@ -258,6 +319,14 @@ class Service:
         return result
 
 
-def _mirror_key(path: Path, prefix: str):
-    key = str(path).lstrip("/")
+def _key_for(path: Path, base: Path | None, prefix: str):
+    """The S3 key for a local file.
+
+    ``base`` None mirrors the absolute path (slash stripped); a ``base`` makes
+    the key relative to it (basename mode). ``prefix`` is prepended either way.
+    """
+    if base is not None:
+        key = path.relative_to(base).as_posix()
+    else:
+        key = str(path).lstrip("/")
     return f"{prefix}/{key}" if prefix else key

@@ -174,6 +174,97 @@ def delete_object(client: BaseClient, bucket: str, key: str):
         raise BuckletError(str(exc) or "could not delete object") from exc
 
 
+def can_delete(client: BaseClient, bucket: str, key: str) -> bool:
+    """Best-effort probe of whether we may delete objects at ``key``'s prefix.
+
+    S3 has no dry run, but ``DeleteObject`` is idempotent: deleting a key that
+    does not exist *succeeds* when you hold ``s3:DeleteObject`` and returns
+    ``AccessDenied`` when you don't. So we delete a sentinel key that shares
+    ``key``'s prefix (so a resource-scoped IAM policy evaluates the same way)
+    and never names a real object — learning the permission without touching
+    any data. ``rename`` uses this to refuse *before* it copies, so a rename
+    can't strand a duplicate.
+
+    Returns True/False for the permission-decisive answers and re-raises
+    anything else (network, wrong region) as :class:`BuckletError`. It is only
+    a best guess: a policy scoped to the exact key, or an object-lock/retention
+    rule, can still block the real delete — which is why ``rename`` also rolls
+    the copy back if the delete ultimately fails.
+
+    On a versioning-enabled bucket the probe delete creates a delete marker even
+    for a key that never existed; we remove that marker afterwards (best-effort,
+    needs ``s3:DeleteObjectVersion``) so the check really does leave no trace.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    prefix = f"{key.rsplit('/', 1)[0]}/" if "/" in key else ""
+    probe = f"{prefix}.bucklet-delete-permission-check"
+    try:
+        resp = client.delete_object(Bucket=bucket, Key=probe)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("403", "AccessDenied", "Forbidden"):
+            return False
+        raise BuckletError(_client_error_message(exc)) from exc
+    except BotoCoreError as exc:
+        raise BuckletError(str(exc) or "could not check delete permission") from exc
+    if resp.get("DeleteMarker") and resp.get("VersionId"):
+        try:
+            client.delete_object(Bucket=bucket, Key=probe, VersionId=resp["VersionId"])
+        except Exception:
+            pass  # a stray marker for a non-existent key is harmless
+    return True
+
+
+def object_exists(client: BaseClient, bucket: str, key: str) -> bool:
+    """True if ``key`` exists. Raises :class:`BuckletError` on a real error.
+
+    A 404/NoSuchKey is the clean "no"; anything else (denied, wrong region) is
+    surfaced so a caller doesn't mistake a permission failure for "absent".
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise BuckletError(_client_error_message(exc)) from exc
+    except BotoCoreError as exc:
+        raise BuckletError(str(exc) or "could not check object") from exc
+
+
+def copy_object(client: BaseClient, bucket: str, src_key: str, dst_key: str, storage_class: str):
+    """Server-side copy ``src_key`` to ``dst_key``, keeping the storage class.
+
+    Used by ``rename`` (copy then delete the original). ``MetadataDirective``
+    is ``COPY`` so user metadata and content type ride along. An archived
+    source can't be read, so S3 returns ``InvalidObjectState``; a single copy
+    tops out at 5 GB (``EntityTooLarge``). Both get a readable message.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        client.copy_object(
+            Bucket=bucket,
+            Key=dst_key,
+            CopySource={"Bucket": bucket, "Key": src_key},
+            StorageClass=storage_class,
+            MetadataDirective="COPY",
+        )
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code == "InvalidObjectState":
+            raise BuckletError("object is archived; thaw it before renaming") from exc
+        if code == "EntityTooLarge":
+            raise BuckletError("object is larger than 5GB; can't rename it by copy") from exc
+        raise BuckletError(_client_error_message(exc)) from exc
+    except BotoCoreError as exc:
+        raise BuckletError(str(exc) or "could not copy object") from exc
+
+
 def download_file(
     client: BaseClient,
     bucket: str,

@@ -9,7 +9,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from textual.widgets import DataTable
+import pytest
+from textual.widgets import Button, Checkbox, DataTable, Input, RadioButton, RadioSet, Tree
 
 from bucklet import storage
 from bucklet.config import Config
@@ -41,17 +42,21 @@ class FakeService:
         self._statuses = {
             "cold.bin": ObjectStatus("cold.bin", storage.COLD, "DEEP_ARCHIVE", 100),
         }
-        self.restored: list[tuple[str, str]] = []
+        self.restored: list[tuple[str, str, int]] = []
         self.downloaded: list[str] = []
         self.deleted: list[str] = []
         self.uploaded: list[str] = []
+        self.renamed: list[tuple[str, str]] = []
         # The (local, key) plan plan_upload hands back, and per-key upload errors.
         self.plan: list[tuple[Path, str]] = []
         self.upload_errors: dict[str, BuckletError] = {}
+        # Records of how the last plan_upload was called, for basename tests.
+        self.plan_calls: list[dict] = []
         # When set, the matching operation raises BuckletError to simulate a
         # denied/broken bucket (e.g. an archive-only key that cannot delete).
         self.list_error: str | None = None
         self.delete_error: str | None = None
+        self.rename_error: str | None = None
 
     def list_objects(self, prefix: str = ""):
         if self.list_error:
@@ -62,7 +67,7 @@ class FakeService:
         return self._statuses.get(key) or ObjectStatus(key, storage.AVAILABLE, "STANDARD")
 
     def restore(self, key: str, *, tier: str = "Bulk", days: int = 7):
-        self.restored.append((key, tier))
+        self.restored.append((key, tier, days))
         return "restore requested"
 
     def download(self, key: str, dest: Path, progress: Callable[[int], None] | None = None):
@@ -77,7 +82,21 @@ class FakeService:
         self.objects = [o for o in self.objects if o.key != key]
         return f"deleted {key}"
 
-    def plan_upload(self, paths, prefix: str = ""):
+    def rename(self, old_key: str, new_key: str):
+        if self.rename_error:
+            raise BuckletError(self.rename_error)
+        self.renamed.append((old_key, new_key))
+        # Mirror S3: the object now lives under the new key.
+        self.objects = [
+            ObjectInfo(new_key, o.size, o.last_modified, o.storage_class) if o.key == old_key else o
+            for o in self.objects
+        ]
+        return f"renamed {old_key} -> {new_key}"
+
+    def plan_upload(self, paths, prefix: str = "", *, basename_key: bool = False):
+        self.plan_calls.append(
+            {"paths": list(paths), "prefix": prefix, "basename_key": basename_key}
+        )
         return list(self.plan)
 
     def upload_many(self, plan, *, storage_class=None, progress=None):
@@ -115,6 +134,12 @@ def _has_message(app, substring: str, severity: str | None = None) -> bool:
     )
 
 
+def _select_radio(screen, set_id: str, index: int):
+    """Pick option ``index`` of a RadioSet (its pressed_index has no setter)."""
+    buttons = list(screen.query_one(f"#{set_id}", RadioSet).query(RadioButton))
+    buttons[index].value = True
+
+
 async def test_table_populates(tmp_path):
     app = _app(tmp_path, FakeService())
     async with app.run_test() as pilot:
@@ -144,7 +169,7 @@ async def test_thaw_cold_object_calls_restore(tmp_path):
         await pilot.pause()
         await pilot.press("t")  # cursor is on row 0 == cold.bin
         await app.workers.wait_for_complete()
-        assert ("cold.bin", "Bulk") in fake.restored
+        assert ("cold.bin", "Bulk", 7) in fake.restored
 
 
 async def test_thaw_available_object_does_nothing(tmp_path):
@@ -159,15 +184,82 @@ async def test_thaw_available_object_does_nothing(tmp_path):
         assert fake.restored == []  # thaw not offered for available objects
 
 
-async def test_thaw_standard_tier(tmp_path):
+async def test_advanced_thaw_picks_tier_and_days(tmp_path):
+    from bucklet.tui.screens import AdvancedThawScreen
+
     fake = FakeService()
     app = _app(tmp_path, fake)
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
-        await pilot.press("T")  # shift+t -> Standard tier, on the cold row
+        await pilot.press("T")  # shift+t -> advanced thaw dialog, on the cold row
+        await pilot.pause()
+        assert isinstance(app.screen, AdvancedThawScreen)
+        screen = app.screen
+        _select_radio(screen, "tier", 1)  # Standard
+        await pilot.pause()
+        screen.query_one("#days", Input).value = "3"
+        screen.query_one("#ok", Button).press()
         await app.workers.wait_for_complete()
-        assert ("cold.bin", "Standard") in fake.restored
+        await pilot.pause()
+        assert ("cold.bin", "Standard", 3) in fake.restored
+
+
+async def test_large_object_thaw_asks_confirmation(tmp_path):
+    from bucklet.tui.app import THAW_CONFIRM_BYTES
+
+    fake = FakeService()
+    fake.objects = [ObjectInfo("big.bin", THAW_CONFIRM_BYTES + 1, None, "DEEP_ARCHIVE")]
+    fake._statuses = {"big.bin": ObjectStatus("big.bin", storage.COLD, "DEEP_ARCHIVE", 0)}
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("t")  # quick thaw on the big cold object
+        await pilot.pause()
+        # a confirmation must stand between the keypress and the restore
+        assert len(app.screen_stack) > 1
+        assert fake.restored == []
+        await pilot.press("y")  # confirm
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert ("big.bin", "Bulk", 7) in fake.restored
+
+
+async def test_advanced_thaw_enter_submits(tmp_path):
+    # The dialog's "enter to thaw" hint must be true: Enter in the days field
+    # confirms (the days Input wires Input.Submitted to the same handler).
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("T")
+        await pilot.pause()
+        app.screen.query_one("#days", Input).focus()
+        await pilot.pause()
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert ("cold.bin", "Bulk", 7) in fake.restored  # default tier + window
+
+
+async def test_large_object_thaw_can_be_declined(tmp_path):
+    from bucklet.tui.app import THAW_CONFIRM_BYTES
+
+    fake = FakeService()
+    fake.objects = [ObjectInfo("big.bin", THAW_CONFIRM_BYTES + 1, None, "DEEP_ARCHIVE")]
+    fake._statuses = {"big.bin": ObjectStatus("big.bin", storage.COLD, "DEEP_ARCHIVE", 0)}
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("t")
+        await pilot.pause()
+        await pilot.press("n")  # decline
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.restored == []  # nothing thawed
 
 
 async def test_download_available_object(tmp_path):
@@ -570,6 +662,26 @@ async def test_message_stack_trims_to_max(tmp_path):
         assert f"msg {MessageStack.MAX + 2}" in texts  # newest kept
 
 
+async def test_keyed_line_survives_trim(tmp_path):
+    """A keyed progress line must not be dropped by trimming — otherwise its next
+    update would stack a new line instead of replacing it."""
+    from bucklet.tui.app import MessageStack
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app.flash("progress 1", key="op", timeout=30.0)  # oldest line, keyed
+        for i in range(MessageStack.MAX):  # enough unkeyed noise to force a trim
+            app.flash(f"noise {i}", timeout=30.0)
+        await pilot.pause()
+        app.flash("progress 2", key="op", timeout=30.0)  # updates in place
+        await pilot.pause()
+        texts = [t for t, _ in _messages(app)]
+        assert texts.count("progress 2") == 1  # one keyed line, updated
+        assert "progress 1" not in texts  # replaced, not stacked
+
+
 async def test_messages_expire(tmp_path):
     import asyncio
 
@@ -780,3 +892,274 @@ async def test_upload_reports_partial_failure(tmp_path):
         await pilot.pause()
         assert fake.uploaded == ["a"]  # the good one still uploaded
         assert _has_message(app, "failed", "error")
+
+
+async def test_upload_basename_checkbox_passes_through(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("u")
+        await pilot.pause()
+        app.screen.query_one("#path", Input).value = "/some/dir"
+        app.screen.query_one("#basename", Checkbox).value = True
+        app.screen.query_one("#ok", Button).press()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.plan_calls[-1]["basename_key"] is True
+
+
+# --- rename (copy + delete; TUI-only, ungated) ------------------------------
+
+
+async def test_rename_renames_object(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # move to doc.txt (available, renamable)
+        await pilot.press("e")
+        await pilot.pause()
+        field = app.screen.query_one("#value", Input)
+        assert field.value == "doc.txt"  # prefilled with the current key
+        field.value = "notes.txt"
+        app.screen.query_one("#ok", Button).press()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert ("doc.txt", "notes.txt") in fake.renamed
+        keys = [o.key for o in app.objects]
+        assert "notes.txt" in keys and "doc.txt" not in keys
+        assert _has_message(app, "renamed")
+
+
+async def test_rename_error_keeps_object(tmp_path):
+    fake = FakeService()
+    fake.rename_error = "an object named 'notes.txt' already exists"
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("e")
+        await pilot.pause()
+        app.screen.query_one("#value", Input).value = "notes.txt"
+        app.screen.query_one("#ok", Button).press()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.renamed == []
+        assert "doc.txt" in [o.key for o in app.objects]  # untouched
+        assert _has_message(app, "already exists", "error")
+
+
+# --- tree (folder) view -----------------------------------------------------
+
+
+def _nested_fake():
+    fake = FakeService()
+    fake.objects = [
+        ObjectInfo("docs/2024/report.txt", 10, None, "STANDARD"),
+        ObjectInfo("docs/2024/notes.txt", 20, None, "STANDARD"),
+        ObjectInfo("images/logo.png", 30, None, "STANDARD"),
+    ]
+    fake._statuses = {}
+    return fake
+
+
+def _tree_labels(node):
+    return [str(child.label) for child in node.children]
+
+
+async def test_view_toggle_shows_tree(tmp_path):
+    fake = _nested_fake()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.query_one(DataTable).display is True
+        await pilot.press("v")
+        await pilot.pause()
+        assert app.view_mode == "tree"
+        assert app.query_one(Tree).display is True
+        assert app.query_one(DataTable).display is False
+        # single-child chain "docs/2024" is collapsed into one folder node
+        labels = _tree_labels(app.query_one(Tree).root)
+        assert "docs/2024/" in labels and "images/" in labels
+
+
+async def test_tree_search_expands_to_matches(tmp_path):
+    fake = _nested_fake()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("v")
+        await pilot.pause()
+        app.search_term = "logo"
+        app.refresh_view()
+        await pilot.pause()
+        tree = app.query_one(Tree)
+        images = next(c for c in tree.root.children if str(c.label) == "images/")
+        assert images.is_expanded  # auto-expanded because it holds a match
+        # the non-matching folder stays collapsed
+        docs = next(c for c in tree.root.children if str(c.label) == "docs/2024/")
+        assert not docs.is_expanded
+
+
+async def test_tree_view_thaw_acts_on_selected_leaf(tmp_path):
+    fake = FakeService()  # cold.bin (DEEP_ARCHIVE) + doc.txt, both top-level
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("v")
+        await pilot.pause()
+        tree = app.query_one(Tree)
+        tree.move_cursor(app._leaf_nodes["cold.bin"])
+        assert app._selected().key == "cold.bin"
+        await pilot.press("t")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert ("cold.bin", "Bulk", 7) in fake.restored
+
+
+# --- WYSIWYG: a custom (non-AWS) profile hides class/state/thaw -------------
+
+
+def _non_aws_app(tmp_path):
+    fake = FakeService()
+    fake.profile.endpoint_url = "https://minio.example"  # -> is_aws False
+    fake.objects = [ObjectInfo("a.txt", 100, None, "STANDARD")]
+    fake._statuses = {}
+    return fake, _app(tmp_path, fake)
+
+
+async def test_non_aws_hides_state_and_class_columns(tmp_path):
+    _fake, app = _non_aws_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        table = app.query_one(DataTable)
+        labels = [str(col.label) for col in table.columns.values()]
+        assert "State" not in labels
+        assert "Class" not in labels
+        assert labels == ["Size", "Modified", "Key"]
+
+
+async def test_non_aws_hides_thaw_and_filter(tmp_path):
+    _fake, app = _non_aws_app(tmp_path)
+    async with app.run_test():
+        await app.workers.wait_for_complete()
+        assert app.check_action("thaw", ()) is False
+        assert app.check_action("advanced_thaw", ()) is False
+        assert app.check_action("filter", ()) is False
+        assert "t" not in app.screen.active_bindings
+        assert "f" not in app.screen.active_bindings
+        # name-based actions stay available
+        assert app.check_action("rename", ()) is True
+        assert app.check_action("download", ()) is True
+
+
+async def test_non_aws_treats_objects_as_available(tmp_path):
+    # Even if a custom endpoint reports an archival class, a non-AWS profile must
+    # treat the object as downloadable (not route it through hidden thaw advice).
+    fake = FakeService()
+    fake.profile.endpoint_url = "https://minio.example"
+    fake.objects = [ObjectInfo("x.bin", 10, None, "DEEP_ARCHIVE")]
+    fake._statuses = {}
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("g")  # download
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert "x.bin" in fake.downloaded
+
+
+async def test_non_aws_bar_omits_state_counts(tmp_path):
+    from textual.widgets import Static
+
+    _fake, app = _non_aws_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        bar = str(app.query_one("#bar", Static).render())
+        assert "cold" not in bar and "thawing" not in bar and "ready" not in bar
+        assert "1 objects (100B)" in bar  # count + total size still shown
+
+
+async def test_non_aws_upload_dialog_hides_class(tmp_path):
+    from textual.css.query import NoMatches
+
+    _fake, app = _non_aws_app(tmp_path)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("u")
+        await pilot.pause()
+        with pytest.raises(NoMatches):
+            app.screen.query_one("#class")
+        assert app.screen.query_one("#basename", Checkbox) is not None
+
+
+# --- bar shows the total size ----------------------------------------------
+
+
+async def test_bar_shows_total_size(tmp_path):
+    from textual.widgets import Static
+
+    fake = FakeService()  # cold.bin 100B + doc.txt 50B = 150B
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        bar = str(app.query_one("#bar", Static).render())
+        assert "2 objects (150B)" in bar
+
+
+# --- add-profile form: segmented choices reveal only relevant fields --------
+
+
+async def test_add_profile_form_toggles_fields(tmp_path):
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("a")
+        await pilot.pause()
+        screen = app.screen
+        # AWS (default): storage class shown, endpoint hidden
+        assert screen.query_one("#class-row").display is True
+        assert screen.query_one("#endpoint-row").display is False
+        # switch to custom S3-compatible
+        _select_radio(screen, "conn", 1)
+        await pilot.pause()
+        assert screen.query_one("#class-row").display is False
+        assert screen.query_one("#endpoint-row").display is True
+        # credentials default to access keys; rclone row hidden until chosen
+        assert screen.query_one("#keys-row").display is True
+        assert screen.query_one("#rclone-row").display is False
+        _select_radio(screen, "creds", 1)
+        await pilot.pause()
+        assert screen.query_one("#keys-row").display is False
+        assert screen.query_one("#rclone-row").display is True
+
+
+async def test_add_profile_custom_endpoint_saves(tmp_path):
+    cfg = Config(tmp_path / "config.json")
+    app = BuckletApp(config=cfg, service=None)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("a")
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#name", Input).value = "minio"
+        screen.query_one("#bucket", Input).value = "bkt"
+        _select_radio(screen, "conn", 1)  # custom
+        _select_radio(screen, "creds", 2)  # env / IAM role
+        await pilot.pause()
+        screen.query_one("#endpoint", Input).value = "https://minio.example"
+        screen.query_one("#ok", Button).press()
+        await pilot.pause()
+        stored = cfg.get("minio")
+        assert stored.endpoint_url == "https://minio.example"
+        assert stored.is_aws is False
+        assert stored.access_key_id is None and stored.rclone_remote is None

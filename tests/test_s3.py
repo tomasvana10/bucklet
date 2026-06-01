@@ -187,6 +187,87 @@ def test_delete_object_access_denied_raises():
         s3.delete_object(FakeClient(), "the-bucket", "k")
 
 
+def _bucket_client(name="the-bucket"):
+    return s3.build_client(
+        Profile(
+            name="t",
+            bucket=name,
+            region="us-east-1",
+            access_key_id="testing",
+            secret_access_key="testing",
+        )
+    )
+
+
+def test_copy_object_roundtrip(s3_client, tmp_path):
+    s3_client.create_bucket(Bucket="the-bucket")
+    client = _bucket_client()
+    src = tmp_path / "f"
+    src.write_text("payload")
+    s3.upload_file(client, "the-bucket", src, "src", "STANDARD_IA")
+
+    s3.copy_object(client, "the-bucket", "src", "dst", "STANDARD_IA")
+    keys = {o.key for o in s3.list_objects(client, "the-bucket")}
+    assert {"src", "dst"} <= keys
+    # the destination keeps the requested storage class
+    assert s3.head_status(client, "the-bucket", "dst").storage_class == "STANDARD_IA"
+
+
+def test_object_exists(s3_client, tmp_path):
+    s3_client.create_bucket(Bucket="the-bucket")
+    client = _bucket_client()
+    src = tmp_path / "f"
+    src.write_text("x")
+    s3.upload_file(client, "the-bucket", src, "here", "STANDARD")
+    assert s3.object_exists(client, "the-bucket", "here") is True
+    assert s3.object_exists(client, "the-bucket", "nope") is False
+
+
+def test_can_delete_true_when_allowed(s3_client):
+    # moto permits the probe delete, so can_delete reports True.
+    s3_client.create_bucket(Bucket="the-bucket")
+    client = _bucket_client()
+    assert s3.can_delete(client, "the-bucket", "some/key.txt") is True
+
+
+def test_can_delete_leaves_no_marker_on_versioned_bucket(s3_client):
+    # On a versioned bucket the probe delete creates a delete marker; can_delete
+    # must clean it up so the check truly leaves no trace.
+    s3_client.create_bucket(Bucket="ver")
+    s3_client.put_bucket_versioning(Bucket="ver", VersioningConfiguration={"Status": "Enabled"})
+    client = _bucket_client("ver")
+    assert s3.can_delete(client, "ver", "a/b.txt") is True
+    versions = client.list_object_versions(Bucket="ver", Prefix="a/.bucklet")
+    assert not versions.get("DeleteMarkers")  # the probe marker was removed
+    assert not versions.get("Versions")
+
+
+def test_can_delete_false_on_access_denied():
+    class FakeClient:
+        def delete_object(self, *args, **kwargs):
+            raise _client_error("AccessDenied")
+
+    assert s3.can_delete(FakeClient(), "the-bucket", "k") is False
+
+
+def test_can_delete_reraises_other_errors():
+    class FakeClient:
+        def delete_object(self, *args, **kwargs):
+            raise _client_error("NoSuchBucket")
+
+    with pytest.raises(BuckletError):
+        s3.can_delete(FakeClient(), "the-bucket", "k")
+
+
+def test_copy_object_archived_source_message():
+    class FakeClient:
+        def copy_object(self, *args, **kwargs):
+            raise _client_error("InvalidObjectState")
+
+    with pytest.raises(BuckletError, match="archived"):
+        s3.copy_object(FakeClient(), "the-bucket", "src", "dst", "GLACIER")
+
+
 def test_head_status_survives_network_error():
     """A non-ClientError botocore failure (e.g. a timeout while polling a
     thawing object) must degrade to an ERROR state, never raise."""

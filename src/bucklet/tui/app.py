@@ -9,18 +9,21 @@ Thaw is offered only when the selected object's live state actually needs it.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import DataTable, Footer, Header, Static, Tree
 from textual.worker import get_current_worker
 
 if TYPE_CHECKING:
     from textual.timer import Timer
+    from textual.widgets.tree import TreeNode
 
 from .. import storage
 from ..config import Config
@@ -28,12 +31,15 @@ from ..errors import BuckletError
 from ..formatting import STATE_STYLE, fmt_date, human
 from ..models import ObjectInfo, ObjectStatus, Profile
 from ..service import Service
+from ..tree import DirNode, FileLeaf, build_key_tree, leaf_name
 from .screens import (
     AddProfileScreen,
+    AdvancedThawScreen,
     ConfirmScreen,
     DetailScreen,
     ProfileScreen,
     PromptScreen,
+    RenameScreen,
     SettingsScreen,
     UploadScreen,
 )
@@ -44,7 +50,15 @@ COL_STATE, COL_SIZE, COL_MOD, COL_CLASS, COL_KEY = "state", "size", "mod", "clas
 _FILTER_CYCLE = [None, storage.COLD, storage.THAWING, storage.THAWED, storage.AVAILABLE]
 
 # Actions that operate on the selected object; greyed out when nothing is listed.
-_OBJECT_ACTIONS = frozenset({"detail", "thaw", "download", "delete"})
+_OBJECT_ACTIONS = frozenset({"detail", "rename", "thaw", "advanced_thaw", "download", "delete"})
+
+# Actions that only make sense on a genuine AWS bucket (storage classes / restores);
+# hidden entirely for a custom S3-compatible profile, where everything is available.
+_AWS_ONLY_ACTIONS = frozenset({"thaw", "advanced_thaw", "filter"})
+
+# Thawing anything larger than this prompts for confirmation first (restores can
+# be slow and, on Expedited, costly). Shown to the user via human().
+THAW_CONFIRM_BYTES = 100 * 1024 * 1024
 
 
 class BuckletFooter(Footer):
@@ -172,7 +186,12 @@ class MessageStack(Vertical):
 
     def _trim(self):
         while len(self._items) > self.MAX:
-            self._expire(self._items[0])
+            # Prefer dropping the oldest *unkeyed* line, so a keyed progress line
+            # (the kind updated in place) isn't silently forgotten — which would
+            # make its next update stack a new line instead of replacing it.
+            keyed = set(self._keyed.values())
+            victim = next((i for i in self._items if i not in keyed), self._items[0])
+            self._expire(victim)
 
 
 class BuckletApp(App):
@@ -181,9 +200,10 @@ class BuckletApp(App):
     CSS = """
     #bar { height: 1; background: $panel; color: $text; padding: 0 1; }
     DataTable { height: 1fr; }
+    Tree { height: 1fr; padding: 0 1; }
 
     DetailScreen, PromptScreen, ProfileScreen, AddProfileScreen, UploadScreen,
-    ConfirmScreen, SettingsScreen {
+    ConfirmScreen, SettingsScreen, RenameScreen, AdvancedThawScreen {
         align: center middle;
     }
     #dialog {
@@ -191,13 +211,29 @@ class BuckletApp(App):
         max-width: 90%;
         height: auto;
         max-height: 80%;
-        padding: 1;
+        padding: 0 1;
         border: round $primary;
         background: $surface;
     }
-    .dialog-title { text-style: bold; color: $secondary; }
+    /* Dialogs are kept dense to match the main UI: one-line inputs and buttons,
+       no chunky borders, so a modal never dwarfs the table behind it. */
+    #dialog Input {
+        height: 1;
+        border: none;
+        padding: 0 1;
+        background: $boost;
+        margin-bottom: 1;
+    }
+    #dialog Input:focus { background: $primary 25%; }
+    #dialog Button { height: 1; min-width: 10; border: none; }
+    #dialog Select, #dialog SelectCurrent { height: 1; border: none; }
+    #dialog SelectCurrent { background: $boost; }
+    #dialog Checkbox { height: 1; border: none; padding: 0; background: transparent; }
+    #dialog .segmented { height: auto; border: none; padding: 0; margin-bottom: 1; }
+    #dialog .segmented RadioButton { border: none; padding: 0; background: transparent; }
+    .dialog-title { text-style: bold; color: $secondary; margin-bottom: 1; }
     .hint { color: $text-muted; }
-    .buttons { height: auto; align-horizontal: right; }
+    .buttons { height: auto; align-horizontal: right; margin-top: 1; }
     .buttons Button { margin-left: 1; }
     """
 
@@ -205,13 +241,15 @@ class BuckletApp(App):
         # Object-specific actions (greyed out when nothing is listed; see
         # check_action). The footer draws a divider after this group.
         Binding("i", "detail", "Info"),
+        Binding("e", "rename", "Rename"),
         Binding("t", "thaw('Bulk')", "Thaw"),
-        Binding("T", "thaw('Standard')", "Thaw+", show=False),
+        Binding("T", "advanced_thaw", "Thaw+"),
         Binding("g", "download", "Get"),
         # Only shown/active when launched with --allow-deletion; see check_action.
         Binding("d", "delete", "Delete"),
         # Bucket-/app-wide actions.
         Binding("u", "upload", "Upload"),
+        Binding("v", "view", "View"),
         Binding("s", "settings", "Settings"),
         Binding("r", "refresh", "Refresh"),
         Binding("slash", "search", "Search"),
@@ -243,21 +281,27 @@ class BuckletApp(App):
         self.displayed: list[ObjectInfo] = []
         self.search_term = ""
         self.state_filter: str | None = None
+        # "flat" is the DataTable; "tree" is the folder view (toggle with 'v').
+        self.view_mode = "flat"
+        self._by_key: dict[str, ObjectInfo] = {}
+        self._leaf_nodes: dict[str, TreeNode] = {}
+        # Which column layout the table currently holds (None until first built);
+        # tracked so we only rebuild columns when AWS-ness actually changes.
+        self._table_aws: bool | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield Static(id="bar")
         yield DataTable(id="objects", zebra_stripes=True, cursor_type="row")
+        yield Tree("", id="tree")
         yield MessageStack(id="messages")
         yield BuckletFooter()
 
     def on_mount(self):
-        table = self.query_one("#objects", DataTable)
-        table.add_column("St", key=COL_STATE, width=6)
-        table.add_column("Size", key=COL_SIZE, width=10)
-        table.add_column("Modified", key=COL_MOD, width=17)
-        table.add_column("Class", key=COL_CLASS, width=20)
-        table.add_column("Key", key=COL_KEY)
+        # The tree's own root is just a container for the top-level entries.
+        tree = self.query_one("#tree", Tree)
+        tree.show_root = False
+        tree.display = False  # flat view is the default
         self._update_bar()
         if self.service is not None:
             self.reload()
@@ -298,71 +342,178 @@ class BuckletApp(App):
         if worker.is_cancelled:
             return
         self.call_from_thread(self._populate, objects)
-        # Refine only archived objects; everything else is already accurate.
+        # Refine only archived objects; everything else is already accurate. A
+        # custom S3 profile has no archival classes, so it needs no HEADs at all.
         for obj in objects:
-            if worker.is_cancelled:
+            if worker.is_cancelled or service is not self.service:
                 return
-            if storage.needs_restore(obj.storage_class):
+            if service.profile.is_aws and storage.needs_restore(obj.storage_class):
                 status = service.status(obj.key)
+                # The blocking HEAD can outlast a profile switch (cancellation is
+                # cooperative); don't let a stale status pollute the new profile.
+                if worker.is_cancelled or service is not self.service:
+                    return
                 self.call_from_thread(self._apply_status, status)
         self.call_from_thread(self.refresh_view)
         self.call_from_thread(self.flash, "", key="status")  # clear "loading…"
 
     def _populate(self, objects: list[ObjectInfo]):
         self.objects = objects
+        self._by_key = {o.key: o for o in objects}
         self.refresh_view()
 
     def _apply_status(self, status: ObjectStatus):
         self.statuses[status.key] = status
-        table = self.query_one("#objects", DataTable)
-        try:
-            table.update_cell(status.key, COL_STATE, self._state_cell(status.state))
-            table.update_cell(status.key, COL_CLASS, status.storage_class)
-        except Exception:
-            pass  # row not currently visible (filtered out)
+        if self.view_mode == "tree":
+            self._relabel_leaf(status.key)
+        else:
+            table = self.query_one("#objects", DataTable)
+            try:
+                table.update_cell(status.key, COL_STATE, self._state_cell(status.state))
+                table.update_cell(status.key, COL_CLASS, status.storage_class)
+            except Exception:
+                pass  # row not visible (filtered out), or no such column (non-AWS)
         self._update_bar()
 
+    def _is_aws(self) -> bool:
+        """Whether the open profile is genuine AWS (storage classes / restores).
+
+        Drives WYSIWYG everywhere: a custom S3-compatible profile has no State
+        or Class column, no thaw, and no upload class picker. With no profile
+        open we assume AWS — there's nothing on screen for it to matter to yet.
+        """
+        return self.service is None or self.service.profile.is_aws
+
     def _state_of(self, obj: ObjectInfo):
+        # A custom S3 profile has no archival states; treat everything as
+        # available so it's never routed through thaw guidance (WYSIWYG).
+        if not self._is_aws():
+            return storage.AVAILABLE
         status = self.statuses.get(obj.key)
         return status.state if status else obj.baseline_state
 
-    def _filtered(self):
-        out = self.objects
-        if self.search_term:
-            term = self.search_term.lower()
-            out = [o for o in out if term in o.key.lower()]
-        if self.state_filter is not None:
-            out = [o for o in out if self._state_of(o) == self.state_filter]
-        return out
+    def _state_filtered(self):
+        """Objects passing the active state filter (the set the views show)."""
+        if self.state_filter is None:
+            return list(self.objects)
+        return [o for o in self.objects if self._state_of(o) == self.state_filter]
 
     def _state_cell(self, state: str):
-        from rich.text import Text
-
         return Text(storage.STATE_LABEL.get(state, "?"), style=STATE_STYLE.get(state, ""))
 
     def refresh_view(self):
-        table = self.query_one("#objects", DataTable)
-        table.clear()
-        self.displayed = self._filtered()
-        for obj in self.displayed:
-            state = self._state_of(obj)
-            stored = self.statuses.get(obj.key)
-            table.add_row(
-                self._state_cell(state),
-                human(obj.size),
-                fmt_date(obj.last_modified),
-                stored.storage_class if stored else obj.storage_class,
-                obj.key,
-                key=obj.key,
-            )
+        if self.view_mode == "tree":
+            self._refresh_tree()
+        else:
+            self._refresh_table()
         self._update_bar()
         # Whether there's anything to act on just changed, so re-evaluate which
         # object actions the footer shows as enabled (see check_action).
         self.refresh_bindings()
 
-    def _update_bar(self):
-        from rich.text import Text
+    def _ensure_columns(self):
+        """(Re)build the table columns for the current profile's AWS-ness.
 
+        A custom S3-compatible profile drops the State and Class columns — its
+        objects are always available, so both would only ever read the same
+        thing (WYSIWYG). Rebuilt only when AWS-ness flips, since it clears rows.
+        """
+        aws = self._is_aws()
+        if self._table_aws == aws:
+            return
+        self._table_aws = aws
+        table = self.query_one("#objects", DataTable)
+        table.clear(columns=True)
+        if aws:
+            table.add_column("State", key=COL_STATE, width=6)
+        table.add_column("Size", key=COL_SIZE, width=10)
+        table.add_column("Modified", key=COL_MOD, width=17)
+        if aws:
+            table.add_column("Class", key=COL_CLASS, width=20)
+        table.add_column("Key", key=COL_KEY)
+
+    def _refresh_table(self):
+        self._ensure_columns()
+        table = self.query_one("#objects", DataTable)
+        table.clear()
+        aws = self._is_aws()
+        rows = self._state_filtered()
+        if self.search_term:
+            term = self.search_term.lower()
+            rows = [o for o in rows if term in o.key.lower()]
+        self.displayed = rows
+        for obj in rows:
+            stored = self.statuses.get(obj.key)
+            cls = stored.storage_class if stored else obj.storage_class
+            if aws:
+                table.add_row(
+                    self._state_cell(self._state_of(obj)),
+                    human(obj.size),
+                    fmt_date(obj.last_modified),
+                    cls,
+                    obj.key,
+                    key=obj.key,
+                )
+            else:
+                table.add_row(human(obj.size), fmt_date(obj.last_modified), obj.key, key=obj.key)
+
+    def _refresh_tree(self):
+        """Rebuild the folder tree from the (state-filtered) objects.
+
+        Search doesn't filter here as it does in the flat view — it highlights
+        matching leaves and expands their folders so every match is on screen,
+        the rest staying collapsed.
+        """
+        tree = self.query_one("#tree", Tree)
+        tree.clear()
+        self._leaf_nodes = {}
+        self.displayed = self._state_filtered()
+        root = build_key_tree([o.key for o in self.displayed])
+        term = self.search_term.lower() if self.search_term else ""
+        self._add_dir(tree.root, root, term)
+        tree.root.expand()
+
+    def _add_dir(self, tnode: TreeNode, dirnode: DirNode, term: str) -> bool:
+        """Populate ``tnode`` from ``dirnode``; return True if anything below
+        matched ``term`` (so the caller can expand to reveal it)."""
+        matched = False
+        for child in dirnode.dirs:
+            branch = tnode.add(Text(f"{child.name}/", style="bold"), data=None)
+            if self._add_dir(branch, child, term):
+                branch.expand()
+                matched = True
+        for leaf in dirnode.files:
+            node = tnode.add_leaf(self._leaf_label(leaf, term), data=leaf.key)
+            self._leaf_nodes[leaf.key] = node
+            if term and term in leaf.key.lower():
+                matched = True
+        return matched
+
+    def _leaf_label(self, leaf: FileLeaf, term: str) -> Text:
+        """A file's tree label: state (AWS only), name (highlit on a match), size."""
+        obj = self._by_key.get(leaf.key)
+        label = Text()
+        if self._is_aws() and obj is not None:
+            state = self._state_of(obj)
+            label.append(
+                f"{storage.STATE_LABEL.get(state, '?'):<6}", style=STATE_STYLE.get(state, "")
+            )
+        hit = bool(term) and term in leaf.key.lower()
+        label.append(leaf.name, style="bold reverse" if hit else "")
+        if obj is not None:
+            label.append(f"  {human(obj.size)}", style="dim")
+        return label
+
+    def _relabel_leaf(self, key: str):
+        """Refresh one tree leaf in place (e.g. after a status poll), keeping
+        the tree's expansion state intact."""
+        node = self._leaf_nodes.get(key)
+        if node is None:
+            return
+        term = self.search_term.lower() if self.search_term else ""
+        node.set_label(self._leaf_label(FileLeaf(leaf_name(key), key), term))
+
+    def _update_bar(self):
         bar = self.query_one("#bar", Static)
         if self.service is None:
             self.title = "bucklet"
@@ -374,26 +525,29 @@ class BuckletApp(App):
         # counts, so the two don't repeat each other.
         self.title = f"bucklet · profile '{prof.name}' · region {prof.region or '?'}"
         self.sub_title = ""
-        counts = {state: 0 for state in storage.STATES}
-        for obj in self.objects:
-            state = self._state_of(obj)
-            counts[state] = counts.get(state, 0) + 1
-        ready = counts[storage.THAWED] + counts[storage.AVAILABLE]
+        total = sum(o.size for o in self.objects)
 
         # Built as a Text (not a markup string) so bucket names / search terms
-        # can't be misread as console markup. State counts wear their state
-        # colour; an active filter/search is bold so it stands out (it replaces
-        # the old toast — the table above already reflects the change).
+        # can't be misread as console markup. The bucket is followed by the count
+        # and total size; the per-state counts (coloured) come next but only for
+        # AWS — a custom S3 profile has no archival states to count (WYSIWYG). An
+        # active filter/search is bold so it stands out.
         text = Text(f"{prof.bucket}   ", style="dim")
-        text.append(f"{len(self.objects)} objects · ")
-        text.append(f"cold {counts[storage.COLD]}", style=STATE_STYLE[storage.COLD])
-        text.append(" · ")
-        text.append(f"thawing {counts[storage.THAWING]}", style=STATE_STYLE[storage.THAWING])
-        text.append(" · ")
-        text.append(f"ready {ready}", style=STATE_STYLE[storage.AVAILABLE])
-        if counts[storage.ERROR]:
+        text.append(f"{len(self.objects)} objects ({human(total)})")
+        if self._is_aws():
+            counts = {state: 0 for state in storage.STATES}
+            for obj in self.objects:
+                counts[self._state_of(obj)] = counts.get(self._state_of(obj), 0) + 1
+            ready = counts[storage.THAWED] + counts[storage.AVAILABLE]
             text.append(" · ")
-            text.append(f"err {counts[storage.ERROR]}", style=STATE_STYLE[storage.ERROR])
+            text.append(f"cold {counts[storage.COLD]}", style=STATE_STYLE[storage.COLD])
+            text.append(" · ")
+            text.append(f"thawing {counts[storage.THAWING]}", style=STATE_STYLE[storage.THAWING])
+            text.append(" · ")
+            text.append(f"ready {ready}", style=STATE_STYLE[storage.AVAILABLE])
+            if counts[storage.ERROR]:
+                text.append(" · ")
+                text.append(f"err {counts[storage.ERROR]}", style=STATE_STYLE[storage.ERROR])
         if self.state_filter is not None:
             text.append("   ")
             text.append(
@@ -441,9 +595,17 @@ class BuckletApp(App):
             return
         for key in keys:
             status = service.status(key)
+            if service is not self.service:
+                return  # profile switched mid-poll; don't apply a stale status
             self.call_from_thread(self._apply_status, status)
 
     def _selected(self):
+        if self.view_mode == "tree":
+            node = self.query_one("#tree", Tree).cursor_node
+            # Only file leaves carry a key; a folder selects nothing actionable.
+            if node is not None and node.data:
+                return self._by_key.get(node.data)
+            return None
         if not self.displayed:
             return None
         table = self.query_one("#objects", DataTable)
@@ -463,11 +625,14 @@ class BuckletApp(App):
 
         Textual reads the return value as: ``True`` show+enable, ``None`` show
         but grey out (still no-op), ``False`` drop entirely. So deletion without
-        --allow-deletion returns False (gone), and the object actions return
-        None when nothing is listed (greyed out, since there's nothing to act
-        on) — leaving the bucket-wide keys always available.
+        --allow-deletion returns False (gone); the storage-class actions (thaw,
+        filter) return False on a custom S3 profile that has no such notion; and
+        the object actions return None when nothing is listed (greyed out, since
+        there's nothing to act on) — leaving the bucket-wide keys available.
         """
         if action == "delete" and not self.allow_deletion:
+            return False
+        if action in _AWS_ONLY_ACTIONS and self.service is not None and not self._is_aws():
             return False
         if action in _OBJECT_ACTIONS and not self.displayed:
             return None
@@ -484,39 +649,94 @@ class BuckletApp(App):
             f"key      : {obj.key}",
             f"size     : {human(obj.size)} ({obj.size} bytes)",
             f"modified : {fmt_date(obj.last_modified)}",
-            f"class    : {status.storage_class if status else obj.storage_class}",
-            f"state    : {state}",
         ]
-        if status and status.restore_expiry:
-            lines.append(f"restored : until {status.restore_expiry}")
-        if storage.can_thaw(state):
-            lines.append("")
-            lines.append("archived. press t (Bulk) or T (Standard) to restore")
-        elif storage.can_download(state):
-            lines.append("")
-            lines.append("press g to download")
+        # Class / state / thaw only mean something on AWS; a custom S3 object is
+        # simply downloadable (WYSIWYG).
+        if self._is_aws():
+            lines.append(f"class    : {status.storage_class if status else obj.storage_class}")
+            lines.append(f"state    : {state}")
+            if status and status.restore_expiry:
+                lines.append(f"restored : until {status.restore_expiry}")
+            if storage.can_thaw(state):
+                lines += ["", "archived. press t (quick) or T (advanced) to restore"]
+            elif storage.can_download(state):
+                lines += ["", "press g to download"]
+        else:
+            lines += ["", "press g to download"]
         self.push_screen(DetailScreen(f"Object · {obj.key}", lines))
 
+    @on(Tree.NodeSelected)
+    def _tree_node_selected(self, event: Tree.NodeSelected):
+        # Enter/click on a file leaf opens its detail, mirroring RowSelected in
+        # the flat view; on a folder the Tree just toggles it.
+        if self.view_mode == "tree" and event.node.data:
+            self.action_detail()
+
     def action_thaw(self, tier: str):
-        if not self._require_service():
-            return
-        obj = self._selected()
+        """Quick thaw: restore at ``tier`` for the default window, confirming
+        first when the object is large (see :data:`THAW_CONFIRM_BYTES`)."""
+        obj = self._thawable()
         if obj is None:
             return
+        self._confirm_large_then(obj, lambda: self._thaw_worker(obj.key, tier, 7))
+
+    def action_advanced_thaw(self):
+        """Thaw with a chosen tier and retention window, via a dialog. The
+        large-object confirmation comes after the dialog, so the choice is made
+        first and only one prompt is in flight at a time."""
+        obj = self._thawable()
+        if obj is None:
+            return
+
+        def go(data: dict | None):
+            if not data:
+                return
+            self._confirm_large_then(
+                obj, lambda: self._thaw_worker(obj.key, data["tier"], data["days"])
+            )
+
+        self.push_screen(AdvancedThawScreen(), go)
+
+    def _thawable(self) -> ObjectInfo | None:
+        """The selected object if a thaw makes sense for it, else None (after
+        flashing why not)."""
+        if not self._require_service():
+            return None
+        obj = self._selected()
+        if obj is None:
+            return None
         state = self._state_of(obj)
         if not storage.can_thaw(state):
             self.flash(f"{obj.key} is {state}, no thaw needed", severity="warning")
-            return
-        self._thaw_worker(obj.key, tier)
+            return None
+        return obj
+
+    def _confirm_large_then(self, obj: ObjectInfo, proceed):
+        """Run ``proceed`` immediately, or behind a confirmation when ``obj``
+        exceeds :data:`THAW_CONFIRM_BYTES`."""
+        if obj.size > THAW_CONFIRM_BYTES:
+            lines = [
+                f"key  : {obj.key}",
+                f"size : {human(obj.size)}",
+                "",
+                f"This object is over {human(THAW_CONFIRM_BYTES)}.",
+                "Are you sure you want to thaw it?",
+            ]
+            self.push_screen(
+                ConfirmScreen(f"Thaw · {obj.key}", lines, confirm_label="Thaw"),
+                lambda ok: proceed() if ok else None,
+            )
+        else:
+            proceed()
 
     @work(thread=True, group="op")
-    def _thaw_worker(self, key: str, tier: str):
+    def _thaw_worker(self, key: str, tier: str, days: int):
         service = self.service
         self.call_from_thread(
-            self.flash, f"requesting {tier} restore: {key}…", key="op", timeout=10.0
+            self.flash, f"requesting {tier} restore ({days}d): {key}…", key="op", timeout=10.0
         )
         try:
-            message = service.restore(key, tier=tier)
+            message = service.restore(key, tier=tier, days=days)
             status = service.status(key)
         except BuckletError as exc:
             self.call_from_thread(
@@ -546,13 +766,18 @@ class BuckletApp(App):
         service = self.service
         dest = Path.cwd() / key
         total = max(size, 1)
+        # boto3 downloads a multipart object on several threads, each calling this
+        # callback, so the running total needs a lock (the upload path does the same).
+        lock = threading.Lock()
         sent = {"n": 0}
 
         def progress(n: int):
-            sent["n"] += n
+            with lock:
+                sent["n"] += n
+                done = sent["n"]
             self.call_from_thread(
                 self.flash,
-                f"downloading {key}… {sent['n'] * 100 // total}%",
+                f"downloading {key}… {done * 100 // total}%",
                 key="op",
                 timeout=15.0,
             )
@@ -606,25 +831,74 @@ class BuckletApp(App):
     def _remove_object(self, key: str):
         """Drop a deleted object from the view without re-listing the bucket."""
         self.objects = [o for o in self.objects if o.key != key]
+        self._by_key.pop(key, None)
         self.statuses.pop(key, None)
+        self.refresh_view()
+
+    def action_rename(self):
+        if not self._require_service():
+            return
+        obj = self._selected()
+        if obj is None:
+            return
+        self.push_screen(
+            RenameScreen(obj.key),
+            lambda new, old=obj.key: self._rename_worker(old, new) if new else None,
+        )
+
+    @work(thread=True, group="op")
+    def _rename_worker(self, old_key: str, new_key: str):
+        service = self.service
+        if service is None:
+            return
+        self.call_from_thread(self.flash, f"renaming {old_key}…", key="op", timeout=10.0)
+        try:
+            message = service.rename(old_key, new_key)
+        except BuckletError as exc:
+            self.call_from_thread(
+                self.flash, f"{old_key}: {exc}", severity="error", timeout=8.0, key="op"
+            )
+            return
+        self.call_from_thread(self._rename_object, old_key, new_key)
+        self.call_from_thread(self.flash, message, key="op")
+
+    def _rename_object(self, old_key: str, new_key: str):
+        """Reflect a successful rename locally, without re-listing (like delete),
+        so the result message isn't wiped by a reload cycle. The new object keeps
+        the old one's class; its cached status is dropped, so an archived object
+        correctly shows cold again — the fresh server-side copy isn't restored."""
+        obj = self._by_key.get(old_key)
+        if obj is None:
+            return
+        stored = self.statuses.pop(old_key, None)
+        cls = stored.storage_class if stored else obj.storage_class
+        self.objects = [o for o in self.objects if o.key != old_key]
+        self.objects.append(ObjectInfo(new_key, obj.size, obj.last_modified, cls))
+        self.objects.sort(key=lambda o: o.key)
+        self._by_key = {o.key: o for o in self.objects}
         self.refresh_view()
 
     def action_upload(self):
         if not self._require_service():
             return
-        default_class = storage.normalize_storage_class(self.service.profile.storage_class)
-        self.push_screen(UploadScreen(default_class), self._on_upload)
+        profile = self.service.profile
+        default_class = storage.normalize_storage_class(profile.storage_class)
+        self.push_screen(UploadScreen(default_class, is_aws=profile.is_aws), self._on_upload)
 
     def _on_upload(self, data: dict | None):
         if not data:
             return
-        self._upload_worker(data["path"], data["storage_class"], data["prefix"])
+        self._upload_worker(
+            data["path"], data["storage_class"], data["prefix"], data.get("basename_key", False)
+        )
 
     @work(thread=True, group="op")
-    def _upload_worker(self, path: str, storage_class: str, prefix: str):
+    def _upload_worker(
+        self, path: str, storage_class: str, prefix: str, basename_key: bool = False
+    ):
         service = self.service
         try:
-            plan = service.plan_upload([path], prefix=prefix)
+            plan = service.plan_upload([path], prefix=prefix, basename_key=basename_key)
         except BuckletError as exc:
             self.call_from_thread(self.flash, str(exc), severity="error", timeout=8.0, key="op")
             return
@@ -735,6 +1009,16 @@ class BuckletApp(App):
         # No toast: the table and the colour-coded filter chip in the bar already
         # show the change, and a toast on every cycle was just noise.
         self.refresh_view()
+
+    def action_view(self):
+        """Toggle between the flat table and the folder (tree) view."""
+        self.view_mode = "tree" if self.view_mode == "flat" else "flat"
+        table = self.query_one("#objects", DataTable)
+        tree = self.query_one("#tree", Tree)
+        table.display = self.view_mode == "flat"
+        tree.display = self.view_mode == "tree"
+        self.refresh_view()
+        (tree if self.view_mode == "tree" else table).focus()
 
     def action_switch_profile(self):
         names = self.config.names()
