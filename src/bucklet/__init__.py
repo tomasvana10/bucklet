@@ -13,6 +13,6 @@ The CLI and the Textual TUI are thin frontends over one UI-agnostic core
     bucklet.tui       the Textual front-end
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = ["__version__"]
