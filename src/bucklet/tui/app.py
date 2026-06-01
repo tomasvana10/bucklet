@@ -662,14 +662,15 @@ class BuckletApp(App):
         but grey out (still no-op), ``False`` drop entirely. So deletion without
         --allow-deletion returns False (gone); the storage-class actions (thaw,
         filter) return False on a custom S3 profile that has no such notion; and
-        the object actions return None when nothing is listed (greyed out, since
-        there's nothing to act on) — leaving the bucket-wide keys available.
+        the object actions return None whenever no object is selected to act on,
+        i.e. nothing is listed, or a folder is highlighted in the tree view,
+        leaving the bucket-wide keys available.
         """
         if action == "delete" and not self.allow_deletion:
             return False
         if action in _AWS_ONLY_ACTIONS and self.service is not None and not self._is_aws():
             return False
-        if action in _OBJECT_ACTIONS and not self.displayed:
+        if action in _OBJECT_ACTIONS and self._selected() is None:
             return None
         return True
 
@@ -706,6 +707,13 @@ class BuckletApp(App):
         # the flat view; on a folder the Tree just toggles it.
         if self.view_mode == "tree" and event.node.data:
             self.action_detail()
+
+    @on(Tree.NodeHighlighted)
+    def _tree_node_highlighted(self):
+        # Moving the cursor between a folder and a file changes whether there's
+        # an object to act on, so re-evaluate which object keys the footer enables.
+        if self.view_mode == "tree":
+            self.refresh_bindings()
 
     def action_thaw(self, tier: str):
         """Quick thaw: restore at ``tier`` for the default window, confirming

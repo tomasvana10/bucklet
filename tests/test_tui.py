@@ -1069,6 +1069,48 @@ async def test_tree_view_thaw_acts_on_selected_leaf(tmp_path):
         assert ("cold.bin", "Bulk", 7) in fake.restored
 
 
+async def test_tree_view_greys_object_actions_on_folder(tmp_path):
+    from textual.widgets._footer import FooterKey
+
+    from bucklet.tui.app import BuckletFooter
+
+    fake = _nested_fake()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("v")
+        await pilot.pause()
+        tree = app.query_one(Tree)
+        footer = app.query_one(BuckletFooter)
+
+        def detail_disabled():
+            fk = next(k for k in footer.query(FooterKey) if k.action == "detail")
+            return fk._disabled
+
+        # cursor on a folder: there's no object to act on, so the object keys
+        # grey out (None), and the footer reflects it.
+        folder = next(c for c in tree.root.children if str(c.label) == "images/")
+        tree.move_cursor(folder)
+        await pilot.pause()
+        await pilot.pause()
+        assert app._selected() is None
+        for action in ("detail", "rename", "download"):
+            assert app.check_action(action, ()) is None
+        assert detail_disabled() is True
+        assert app.check_action("upload", ()) is True  # bucket-wide keys stay live
+
+        # expand the folder, then put the cursor on a file leaf: object keys return
+        folder.expand()
+        await pilot.pause()
+        tree.move_cursor(app._leaf_nodes["images/logo.png"])
+        await pilot.pause()
+        await pilot.pause()
+        assert app._selected().key == "images/logo.png"
+        for action in ("detail", "rename", "download"):
+            assert app.check_action(action, ()) is True
+        assert detail_disabled() is False
+
+
 # --- WYSIWYG: a custom (non-AWS) profile hides class/state/thaw -------------
 
 
