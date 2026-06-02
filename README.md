@@ -1,5 +1,7 @@
 # bucklet
 
+<img width="600" src="./assets/showcase.png">
+
 Bucklet is a small CLI/TUI tool for managing objects in S3 compatible buckets, with support for all storage classes.
 
 ## Install
