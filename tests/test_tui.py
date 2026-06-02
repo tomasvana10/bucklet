@@ -1436,3 +1436,75 @@ async def test_footer_single_row_when_wide(tmp_path):
         footer = app.query_one(BuckletFooter)
         assert footer.show_horizontal_scrollbar is False
         assert footer.size.height == 1  # no scrollbar, no extra row
+
+
+# --- the cursor keeps its place across a rebuild (refresh / reload) ----------
+
+
+async def test_flat_view_keeps_cursor_after_reload(tmp_path):
+    fake = FakeService()  # cold.bin (row 0), doc.txt (row 1)
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # move off the first row, onto doc.txt
+        assert app._selected().key == "doc.txt"
+        app.reload()  # a refresh used to snap the cursor back to the top
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._selected().key == "doc.txt"
+
+
+async def test_refresh_view_preserves_flat_cursor(tmp_path):
+    # a rebuild from any source (a status poll, a background update) keeps the
+    # selection rather than resetting it to the first row
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # doc.txt
+        app.refresh_view()
+        await pilot.pause()
+        assert app._selected().key == "doc.txt"
+
+
+async def test_flat_cursor_resets_when_selection_disappears(tmp_path):
+    # if the selected object is gone after a reload, the cursor falls back to the
+    # top rather than pointing at nothing
+    fake = FakeService()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("down")  # doc.txt
+        assert app._selected().key == "doc.txt"
+        fake.objects = [ObjectInfo("cold.bin", 100, None, "DEEP_ARCHIVE")]  # doc.txt vanishes
+        app.reload()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app._selected().key == "cold.bin"  # back to the (only) first row
+
+
+async def test_tree_view_keeps_cursor_and_expansion_after_reload(tmp_path):
+    fake = _nested_fake()
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("v")
+        await pilot.pause()
+        tree = app.query_one(Tree)
+        folder = next(c for c in tree.root.children if str(c.label) == "docs/2024/")
+        folder.expand()
+        await pilot.pause()
+        tree.move_cursor(app._leaf_nodes["docs/2024/report.txt"])
+        await pilot.pause()
+        assert app._selected().key == "docs/2024/report.txt"
+        app.reload()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.pause()
+        tree = app.query_one(Tree)
+        folder = next(c for c in tree.root.children if str(c.label) == "docs/2024/")
+        assert folder.is_expanded  # the open folder stayed open
+        assert app._selected().key == "docs/2024/report.txt"  # and the leaf stayed selected

@@ -474,14 +474,60 @@ class BuckletApp(App):
         return Text(self._state_display(state, status), style=STATE_STYLE.get(state, ""))
 
     def refresh_view(self):
+        # Remember the selection (and, in the tree, which folders are open)
+        # before the rebuild, so a refresh, the initial-load status refinement,
+        # or a filter change doesn't snap the cursor back to the first row.
+        selected = self._selected()
+        selected_key = selected.key if selected else None
         if self.view_mode == "tree":
-            self._refresh_tree()
+            self._refresh_tree(self._expanded_dirs())
         else:
             self._refresh_table()
+        self._restore_cursor(selected_key)
         self._update_bar()
         # Whether there's anything to act on just changed, so re-evaluate which
         # object actions the footer shows as enabled (see check_action).
         self.refresh_bindings()
+
+    def _expanded_dirs(self) -> set[str]:
+        """Paths of the folders open in the tree right now (e.g. ``docs/2024/``),
+        so a rebuild can reopen exactly the same ones."""
+        paths: set[str] = set()
+
+        def walk(node: TreeNode, prefix: str):
+            for child in node.children:
+                if child.data is not None:
+                    continue  # a file leaf, not a folder
+                path = prefix + str(child.label)
+                if child.is_expanded:
+                    paths.add(path)
+                walk(child, path)
+
+        walk(self.query_one("#tree", Tree).root, "")
+        return paths
+
+    def _restore_cursor(self, key: str | None):
+        """Put the cursor back on ``key`` after a rebuild, so a refresh or a
+        status poll doesn't snap the selection to the first row. A no-op when
+        ``key`` is gone (deleted, or filtered out of the current view)."""
+        if key is None:
+            return
+        if self.view_mode == "tree":
+            node = self._leaf_nodes.get(key)
+            if node is None:
+                return
+            tree = self.query_one("#tree", Tree)
+            # move_cursor reads node._line, which stays -1 until the line cache
+            # is (re)built; materialise it first so the restore actually lands.
+            try:
+                _ = tree._tree_lines
+            except Exception:
+                pass
+            tree.move_cursor(node, animate=False)
+            return
+        index = next((i for i, o in enumerate(self.displayed) if o.key == key), None)
+        if index is not None:
+            self.query_one("#objects", DataTable).move_cursor(row=index, animate=False)
 
     def _ensure_columns(self):
         """(Re)build the table columns for the current profile's AWS-ness.
@@ -529,12 +575,13 @@ class BuckletApp(App):
             else:
                 table.add_row(human(obj.size), fmt_date(obj.last_modified), obj.key, key=obj.key)
 
-    def _refresh_tree(self):
+    def _refresh_tree(self, expanded: set[str] | None = None):
         """Rebuild the folder tree from the (state-filtered) objects.
 
         Search doesn't filter here as it does in the flat view — it highlights
         matching leaves and expands their folders so every match is on screen,
-        the rest staying collapsed.
+        the rest staying collapsed. ``expanded`` reopens the folders that were
+        open before a rebuild (see :meth:`_expanded_dirs`).
         """
         tree = self.query_one("#tree", Tree)
         tree.clear()
@@ -542,18 +589,24 @@ class BuckletApp(App):
         self.displayed = self._state_filtered()
         root = build_key_tree([o.key for o in self.displayed])
         term = self.search_term.lower() if self.search_term else ""
-        self._add_dir(tree.root, root, term)
+        self._add_dir(tree.root, root, term, expanded or set())
         tree.root.expand()
 
-    def _add_dir(self, tnode: TreeNode, dirnode: DirNode, term: str) -> bool:
+    def _add_dir(
+        self, tnode: TreeNode, dirnode: DirNode, term: str, expanded: set[str], prefix: str = ""
+    ) -> bool:
         """Populate ``tnode`` from ``dirnode``; return True if anything below
-        matched ``term`` (so the caller can expand to reveal it)."""
+        matched ``term`` (so the caller can expand to reveal it). A folder whose
+        path is in ``expanded`` is reopened too, preserving the view's open
+        folders across a rebuild."""
         matched = False
         for child in dirnode.dirs:
+            path = f"{prefix}{child.name}/"
             branch = tnode.add(Text(f"{child.name}/", style="bold"), data=None)
-            if self._add_dir(branch, child, term):
+            child_matched = self._add_dir(branch, child, term, expanded, path)
+            if child_matched or path in expanded:
                 branch.expand()
-                matched = True
+            matched = matched or child_matched
         for leaf in dirnode.files:
             node = tnode.add_leaf(self._leaf_label(leaf, term), data=leaf.key)
             self._leaf_nodes[leaf.key] = node
