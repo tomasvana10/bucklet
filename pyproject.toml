@@ -1,6 +1,6 @@
 [project]
 name = "bucklet"
-version = "1.0.0"
+version = "1.0.1"
 description = "Manage S3 objects in any storage class."
 readme = "README.md"
 requires-python = ">=3.10"
