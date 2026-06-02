@@ -67,8 +67,8 @@ def build_parser():
             "--profile",
             metavar="NAME",
             default=argparse.SUPPRESS,
-            help="profile to use (a saved name, or a raw bucket name); "
-            "defaults to the configured default profile",
+            help="profile to use (a saved name, or a raw bucket name). "
+            "Defaults to the configured default profile",
         ),
         _profile_completer,
     )
@@ -361,7 +361,7 @@ def cmd_stat(config: Config, args: argparse.Namespace):
         if st.restore_expiry:
             print(f"  restored : until {st.restore_expiry}")
         if storage.can_thaw(st.state):
-            print("  note     : archived; run 'bucklet thaw' before downloading")
+            print("  note     : archived, run 'bucklet thaw' before downloading")
     return 0
 
 
@@ -396,8 +396,8 @@ def _profile_add(config: Config, args: argparse.Namespace):
     if args.storage_class:
         cls = storage.normalize_storage_class(args.storage_class)
     # `add` overwrites connection settings, but it has no flags for the transfer
-    # tuning (that's `profile tune`'s job), so carry any existing tuning across
-    # an overwrite rather than silently wiping it.
+    # tuning (that's `profile tune`'s job) or the TUI's remembered view, so carry
+    # any existing ones across an overwrite rather than silently wiping them.
     prior = config.stored(args.name) if config.has(args.name) else {}
     profile = Profile(
         name=args.name,
@@ -412,6 +412,7 @@ def _profile_add(config: Config, args: argparse.Namespace):
         multipart_chunksize=prior.get("multipart_chunksize"),
         upload_concurrency=prior.get("upload_concurrency"),
         max_concurrency=prior.get("max_concurrency"),
+        view=prior.get("view", "flat"),
     )
     config.add(profile, make_default=args.default)
     config.save()

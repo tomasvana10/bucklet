@@ -161,8 +161,10 @@ source's storage class.
 
 ### The tree view
 
-The flat `DataTable` is the default; `v` toggles a `Tree` built from the keys by
-the pure `tree.build_key_tree`. It collapses single-child directory chains the
+The flat `DataTable` is the default for a profile that has never been switched;
+`v` toggles a `Tree` built from the keys by the pure `tree.build_key_tree`, and
+the choice is remembered per profile (stored as `view`, see "Versioning and
+migrations" for the v2 that added it). It collapses single-child directory chains the
 way GitHub and file browsers do — `x/y/z/file.txt` becomes one folder `x/y/z`,
 not three nested ones — and stops collapsing at the first branch, so structure
 stays legible without a row per prefix level. Keeping the build pure means the
@@ -194,6 +196,13 @@ back to cold. Either way, thawing an object larger than `THAW_CONFIRM_BYTES`
 Expedited tier, costly. The size threshold is one constant, shown to the user
 through `human()` so the prompt and the rule can't drift apart.
 
+Once an object is thawed, its `ready` state grows a countdown (`ready (2d)`,
+`ready (50m)`) so you can see how long the restored copy stays downloadable
+before it lapses back to cold. The window comes from the `expiry-date` in the
+S3 `Restore` header, turned into a compact largest-unit string by
+`formatting.thaw_remaining` (which takes an injectable `now`, so it's tested
+without a clock).
+
 ## Configuration
 
 The config lives at the platform's per-user config path (`~/.config/bucklet` on
@@ -206,7 +215,8 @@ The file carries a `version`. On load, `config._migrate` walks it up to
 `CONFIG_VERSION` one step at a time, so adding a new format is just appending the
 next `if version < N:` block — each step reshapes the dict and bumps `version`.
 A file with no `version` is the original pre-versioning layout, treated as v1
-(the same shape), so it just gains a stamp. The upgrade is written back on load
+(the same shape), so it just gains a stamp. v2 adds a per-profile `view` (the
+TUI's flat/tree choice), backfilled to `flat` for profiles that predate it. The upgrade is written back on load
 (best-effort — a read-only dir won't fail the load), and a config from a *newer*
 bucklet is refused rather than silently downgraded. Every `save` writes the
 current version, so the only thing a new migration has to get right is the

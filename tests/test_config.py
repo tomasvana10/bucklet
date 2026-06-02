@@ -136,6 +136,40 @@ def test_legacy_config_is_migrated_and_persisted(config_dir):
 
 
 @pytest.mark.usefixtures("config_dir")
+def test_v1_config_gains_default_view_on_migration(config_dir):
+    # a v1 profile predates the per-profile view; it should land on flat and the
+    # backfill should be written to disk under the new version
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "config.json"
+    path.write_text(json.dumps({"version": 1, "profiles": {"old": {"bucket": "b"}}}))
+
+    cfg = Config.load()
+    assert cfg.get("old").view == "flat"
+    on_disk = json.loads(path.read_text())
+    assert on_disk["version"] == CONFIG_VERSION
+    assert on_disk["profiles"]["old"]["view"] == "flat"
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_view_round_trips():
+    cfg = Config.load()
+    cfg.add(Profile(name="p", bucket="b", view="tree"))
+    cfg.save()
+    assert Config.load().get("p").view == "tree"
+
+
+@pytest.mark.usefixtures("config_dir")
+def test_unknown_view_falls_back_to_flat(config_dir):
+    # a hand-edited junk view must not leak into the TUI
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "config.json"
+    path.write_text(
+        json.dumps({"version": CONFIG_VERSION, "profiles": {"p": {"bucket": "b", "view": "grid"}}})
+    )
+    assert Config.load().get("p").view == "flat"
+
+
+@pytest.mark.usefixtures("config_dir")
 def test_config_from_newer_bucklet_is_refused(config_dir):
     config_dir.mkdir(parents=True, exist_ok=True)
     path = config_dir / "config.json"

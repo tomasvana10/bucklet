@@ -185,7 +185,7 @@ class AdvancedThawScreen(ModalScreen[dict | None]):
                 yield RadioButton("Bulk · ~48h, cheapest", value=True)
                 yield RadioButton("Standard · ~12h")
                 yield RadioButton("Expedited · ~5min, dearest")
-            yield Label("days to keep it thawed (before S3 re-archives it)")
+            yield Label("days to keep thawed before re-archival")
             yield Input(value=str(self._default_days), id="days")
             yield Label("enter to thaw · esc to cancel", classes="hint")
             with Horizontal(classes="buttons"):
@@ -292,7 +292,7 @@ class AddProfileScreen(ModalScreen[dict | None]):
                 yield Input(id="secret", password=True)
             with Vertical(id="rclone-row"):
                 yield Label("rclone remote")
-                yield Input(id="rclone", placeholder="rclone remote name")
+                yield Input(id="rclone", placeholder="remote name")
 
             with Horizontal(classes="buttons"):
                 yield Button("Save", id="ok", variant="primary")

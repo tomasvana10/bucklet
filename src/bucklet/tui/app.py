@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 from .. import storage
 from ..config import Config
 from ..errors import BuckletError
-from ..formatting import STATE_STYLE, fmt_date, human
+from ..formatting import STATE_STYLE, fmt_date, human, thaw_remaining
 from ..models import ObjectInfo, ObjectStatus, Profile
 from ..service import Service
 from ..tree import DirNode, FileLeaf, build_key_tree, leaf_name
@@ -46,6 +46,10 @@ from .screens import (
 
 # DataTable column keys.
 COL_STATE, COL_SIZE, COL_MOD, COL_CLASS, COL_KEY = "state", "size", "mod", "class", "key"
+
+# Width of the State column / tree state prefix. Wide enough for a thawed row's
+# countdown, e.g. "ready (50m)", not just the bare "ready" label.
+STATE_COL_WIDTH = 11
 
 _FILTER_CYCLE = [None, storage.COLD, storage.THAWING, storage.THAWED, storage.AVAILABLE]
 
@@ -82,9 +86,23 @@ class BuckletFooter(Footer):
     then walk them, dropping a divider in wherever the action moves to the next
     group in ``_FOOTER_GROUPS``. The profile group is prefixed with a muted
     "Profile" label, and the View key shows an icon for the active view.
+
+    On a terminal too narrow for every key, the footer scrolls sideways rather
+    than dropping keys off the edge. Textual has no wrapping layout, so the row
+    can't reflow onto a second line; instead it gains a thin horizontal scrollbar
+    and grows from one row to two to make room for it, but only while the content
+    actually overflows. A wide terminal keeps the usual single-row footer.
     """
 
     DEFAULT_CSS = """
+    BuckletFooter {
+        height: auto;
+        max-height: 2;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-size-horizontal: 1;
+        scrollbar-size-vertical: 0;
+    }
     BuckletFooter .footer-divider {
         width: 1;
         color: $foreground 40%;
@@ -254,6 +272,9 @@ class BuckletApp(App):
     #dialog Input:focus { background: $primary 25%; }
     #dialog Button { height: 1; min-width: 10; border: none; }
     #dialog Select, #dialog SelectCurrent { height: 1; border: none; }
+    /* Match the spacing of the Input fields, which carry a margin-bottom of 1,
+       so the storage-class dropdown isn't crammed against the field below it. */
+    #dialog Select { margin-bottom: 1; }
     #dialog SelectCurrent { background: $boost; }
     #dialog Checkbox { height: 1; border: none; padding: 0; background: transparent; }
     /* The field-group wrappers (#class-row, #endpoint-row, …) are plain Vertical
@@ -288,7 +309,7 @@ class BuckletApp(App):
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
         # Profile management: its own footer section, labelled "Profile".
-        Binding("p", "switch_profile", "Show"),
+        Binding("p", "switch_profile", "Switch"),
         Binding("a", "add_profile", "Add"),
         Binding("s", "settings", "Settings"),
         # Ctrl+C quits too, instead of nagging the user to press Ctrl+Q.
@@ -335,7 +356,11 @@ class BuckletApp(App):
         # The tree's own root is just a container for the top-level entries.
         tree = self.query_one("#tree", Tree)
         tree.show_root = False
-        tree.display = False  # flat view is the default
+        # A pre-attached service (the tests' path) carries its own remembered
+        # view; otherwise the flat table is the default until a profile opens.
+        if self.service is not None:
+            self.view_mode = self._profile_view(self.service.profile)
+        self._apply_view()
         self._update_bar()
         if self.service is not None:
             self.reload()
@@ -403,7 +428,7 @@ class BuckletApp(App):
         else:
             table = self.query_one("#objects", DataTable)
             try:
-                table.update_cell(status.key, COL_STATE, self._state_cell(status.state))
+                table.update_cell(status.key, COL_STATE, self._state_cell(status.state, status))
                 table.update_cell(status.key, COL_CLASS, status.storage_class)
             except Exception:
                 pass  # row not visible (filtered out), or no such column (non-AWS)
@@ -432,8 +457,21 @@ class BuckletApp(App):
             return list(self.objects)
         return [o for o in self.objects if self._state_of(o) == self.state_filter]
 
-    def _state_cell(self, state: str):
-        return Text(storage.STATE_LABEL.get(state, "?"), style=STATE_STYLE.get(state, ""))
+    def _state_display(self, state: str, status: ObjectStatus | None) -> str:
+        """The state label, with a thawed object's remaining window appended.
+
+        A ``ready`` row becomes ``ready (2d)`` once we know when its restored copy
+        lapses back to cold, so the table shows how long it stays downloadable.
+        """
+        label = storage.STATE_LABEL.get(state, "?")
+        if state == storage.THAWED and status is not None:
+            left = thaw_remaining(status.restore_expiry)
+            if left:
+                return f"{label} ({left})"
+        return label
+
+    def _state_cell(self, state: str, status: ObjectStatus | None = None):
+        return Text(self._state_display(state, status), style=STATE_STYLE.get(state, ""))
 
     def refresh_view(self):
         if self.view_mode == "tree":
@@ -459,7 +497,7 @@ class BuckletApp(App):
         table = self.query_one("#objects", DataTable)
         table.clear(columns=True)
         if aws:
-            table.add_column("State", key=COL_STATE, width=6)
+            table.add_column("State", key=COL_STATE, width=STATE_COL_WIDTH)
         table.add_column("Size", key=COL_SIZE, width=10)
         table.add_column("Modified", key=COL_MOD, width=17)
         if aws:
@@ -481,7 +519,7 @@ class BuckletApp(App):
             cls = stored.storage_class if stored else obj.storage_class
             if aws:
                 table.add_row(
-                    self._state_cell(self._state_of(obj)),
+                    self._state_cell(self._state_of(obj), stored),
                     human(obj.size),
                     fmt_date(obj.last_modified),
                     cls,
@@ -529,8 +567,10 @@ class BuckletApp(App):
         label = Text()
         if self._is_aws() and obj is not None:
             state = self._state_of(obj)
+            status = self.statuses.get(leaf.key)
             label.append(
-                f"{storage.STATE_LABEL.get(state, '?'):<6}", style=STATE_STYLE.get(state, "")
+                f"{self._state_display(state, status):<{STATE_COL_WIDTH}}",
+                style=STATE_STYLE.get(state, ""),
             )
         hit = bool(term) and term in leaf.key.lower()
         label.append(leaf.name, style="bold reverse" if hit else "")
@@ -691,7 +731,9 @@ class BuckletApp(App):
             lines.append(f"class    : {status.storage_class if status else obj.storage_class}")
             lines.append(f"state    : {state}")
             if status and status.restore_expiry:
-                lines.append(f"thawed   : until {status.restore_expiry}")
+                left = thaw_remaining(status.restore_expiry)
+                tail = f" ({left} left)" if left else ""
+                lines.append(f"thawed   : until {status.restore_expiry}{tail}")
             if storage.can_thaw(state):
                 lines += ["", "archived. press t (quick) or T (advanced) to thaw"]
             elif storage.can_download(state):
@@ -979,7 +1021,7 @@ class BuckletApp(App):
             extra = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
             self.call_from_thread(
                 self.flash,
-                f"{len(failures)}/{len(results)} failed — {key}: {err}{extra}",
+                f"{len(failures)}/{len(results)} failed, {key}: {err}{extra}",
                 severity="error",
                 timeout=8.0,
                 key="op",
@@ -1053,14 +1095,43 @@ class BuckletApp(App):
         self.refresh_view()
 
     def action_view(self):
-        """Toggle between the flat table and the folder (tree) view."""
+        """Toggle between the flat table and the folder (tree) view, and
+        remember the choice for this profile."""
         self.view_mode = "tree" if self.view_mode == "flat" else "flat"
+        self._apply_view(focus=True)
+        self.refresh_view()
+        self._persist_view()
+
+    def _profile_view(self, profile: Profile) -> str:
+        """The view to open a profile in, defaulting to the flat table."""
+        return profile.view if profile.view in ("flat", "tree") else "flat"
+
+    def _apply_view(self, *, focus: bool = False):
+        """Show the widget for the current ``view_mode`` and hide the other."""
         table = self.query_one("#objects", DataTable)
         tree = self.query_one("#tree", Tree)
         table.display = self.view_mode == "flat"
         tree.display = self.view_mode == "tree"
-        self.refresh_view()
-        (tree if self.view_mode == "tree" else table).focus()
+        if focus:
+            (tree if self.view_mode == "tree" else table).focus()
+
+    def _persist_view(self):
+        """Save the current view on the open profile, if it's a saved one.
+
+        A raw-bucket profile has nowhere to store it, so the choice just lasts
+        the session. A write failure is non-fatal for the same reason settings
+        writes are: the view already applies in memory.
+        """
+        if self.service is None:
+            return
+        profile = self.service.profile
+        profile.view = self.view_mode
+        if self.config.has(profile.name):
+            self.config.stored(profile.name)["view"] = self.view_mode
+            try:
+                self.config.save()
+            except OSError:
+                pass
 
     def action_switch_profile(self):
         names = self.config.names()
@@ -1104,6 +1175,8 @@ class BuckletApp(App):
         self.service = service
         self.search_term = ""
         self.state_filter = None
+        self.view_mode = self._profile_view(service.profile)
+        self._apply_view(focus=True)
         self.flash(f"opened profile '{service.profile.name}'")
         self.reload()
 

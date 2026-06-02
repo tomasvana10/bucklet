@@ -65,9 +65,9 @@ STATES = (AVAILABLE, COLD, THAWING, THAWED, ERROR, UNKNOWN)
 STATE_LABEL = {
     AVAILABLE: "avail",
     COLD: "cold",
-    THAWING: "thaw>",
+    THAWING: "thaw",
     THAWED: "ready",
-    ERROR: "err!",
+    ERROR: "err",
     UNKNOWN: "?",
 }
 

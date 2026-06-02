@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from . import storage
 from .errors import BuckletError
@@ -85,3 +86,38 @@ def fmt_date(dt: datetime | None) -> str:
         return dt.astimezone().strftime("%Y-%m-%d %H:%M")
     except (ValueError, OSError):
         return str(dt)[:16]
+
+
+def thaw_remaining(expiry: str | None, *, now: datetime | None = None) -> str | None:
+    """How long a thawed copy has left before S3 lets it lapse back to cold.
+
+    Parses the S3 ``expiry-date`` (an HTTP date such as
+    ``Fri, 21 Dec 2012 00:00:00 GMT``) and returns the gap from now to it as a
+    single largest unit: ``2d``, ``5h``, ``50m``, or ``<1m`` when it's nearly up.
+    Returns None when there's no expiry, it can't be parsed, or it has already
+    passed. ``now`` is injectable so the conversion is testable.
+    """
+    if not expiry:
+        return None
+    try:
+        when = parsedate_to_datetime(expiry)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    # S3 stamps the expiry in GMT; a header missing the zone is still UTC.
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    seconds = (when - current).total_seconds()
+    if seconds <= 0:
+        return None
+    if seconds >= 86400:
+        return f"{int(seconds // 86400)}d"
+    if seconds >= 3600:
+        return f"{int(seconds // 3600)}h"
+    if seconds >= 60:
+        return f"{int(seconds // 60)}m"
+    return "<1m"

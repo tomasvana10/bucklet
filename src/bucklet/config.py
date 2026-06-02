@@ -4,13 +4,13 @@ The config is a small JSON file living in the user config directory
 (``<config dir>/config.json``)::
 
     {
-      "version": 1,
+      "version": 2,
       "default": "cold",
       "profiles": {
         "cold": {"bucket": "...", "region": "...", "storage_class": "DEEP_ARCHIVE",
                  "rclone_remote": "...", "endpoint_url": null,
                  "access_key_id": null, "secret_access_key": null,
-                 "multipart_chunksize": 67108864}
+                 "multipart_chunksize": 67108864, "view": "flat"}
       }
     }
 
@@ -39,7 +39,7 @@ from .models import Profile
 from .rclone import creds_from_rclone
 
 # Bump when the stored shape changes, and add a step to _migrate().
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 # Persisted profile keys. Everything else on Profile is derived at runtime.
 _STORED_KEYS = (
@@ -54,6 +54,7 @@ _STORED_KEYS = (
     "multipart_chunksize",
     "upload_concurrency",
     "max_concurrency",
+    "view",
 )
 
 
@@ -61,12 +62,12 @@ def _migrate(data: dict) -> bool:
     """Upgrade a parsed config dict in place to :data:`CONFIG_VERSION`.
 
     Migrations run one version at a time, so growing the format is just adding
-    the next ``if`` below. For example, to introduce v2::
+    the next ``if`` below. For example, to introduce v3::
 
-        if version < 2:
+        if version < 3:
             for prof in data.get("profiles", {}).values():
-                prof["something"] = ...      # reshape each v1 profile
-            version = 2
+                prof["something"] = ...      # reshape each v2 profile
+            version = 3
 
     A file with no ``version`` predates versioning and is treated as v1 (the
     same shape), so the only change there is stamping the version. A file from a
@@ -80,14 +81,18 @@ def _migrate(data: dict) -> bool:
     if version > CONFIG_VERSION:
         raise BuckletError(
             f"config version {version} is newer than this bucklet understands "
-            f"(v{CONFIG_VERSION}); upgrade bucklet to use it"
+            f"(v{CONFIG_VERSION}). Upgrade bucklet to use it"
         )
     start = version
 
     # --- migration steps (append the next one here) ------------------------
-    # if version < 2:
-    #     ...
-    #     version = 2
+    if version < 2:
+        # v2 remembers the TUI's flat/tree view per profile. Existing profiles
+        # have never had one, so they start on the flat table.
+        for prof in data.get("profiles", {}).values():
+            if isinstance(prof, dict):
+                prof.setdefault("view", "flat")
+        version = 2
     # -----------------------------------------------------------------------
 
     version = CONFIG_VERSION
@@ -184,6 +189,7 @@ class Config:
 
     def materialize(self, name: str, stored: dict):
         """Turn a stored dict into a fully resolved Profile."""
+        view = stored.get("view")
         prof = Profile(
             name=name,
             bucket=stored.get("bucket"),
@@ -197,6 +203,8 @@ class Config:
             multipart_chunksize=stored.get("multipart_chunksize"),
             upload_concurrency=stored.get("upload_concurrency"),
             max_concurrency=stored.get("max_concurrency"),
+            # Anything a hand-edit left that isn't a known view falls back to flat.
+            view=view if view in ("flat", "tree") else "flat",
         )
         if not prof.has_explicit_keys and prof.rclone_remote:
             rc = creds_from_rclone(prof.rclone_remote) or {}

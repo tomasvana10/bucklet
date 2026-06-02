@@ -1,11 +1,12 @@
 """Tests for the display helpers."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import pytest
 
 from bucklet.errors import BuckletError
-from bucklet.formatting import fmt_date, human, parse_count, parse_size
+from bucklet.formatting import fmt_date, human, parse_count, parse_size, thaw_remaining
 
 
 @pytest.mark.parametrize(
@@ -73,3 +74,44 @@ def test_fmt_date_none():
 def test_fmt_date_value():
     # naive datetime is treated as local wall-clock, no shift
     assert fmt_date(datetime(2020, 1, 2, 3, 4)) == "2020-01-02 03:04"
+
+
+_NOW = datetime(2020, 1, 1, 0, 0, tzinfo=timezone.utc)
+
+
+def _expiry(**delta):
+    """An S3-style GMT expiry-date `delta` from the fixed _NOW used in tests."""
+    return format_datetime(_NOW + timedelta(**delta), usegmt=True)
+
+
+@pytest.mark.parametrize(
+    "delta,expected",
+    [
+        (dict(days=2), "2d"),
+        (dict(hours=50), "2d"),  # floored to the largest whole unit
+        (dict(days=1), "1d"),
+        (dict(hours=5), "5h"),
+        (dict(minutes=50), "50m"),
+        (dict(seconds=30), "<1m"),  # nearly lapsed
+    ],
+)
+def test_thaw_remaining(delta, expected):
+    assert thaw_remaining(_expiry(**delta), now=_NOW) == expected
+
+
+@pytest.mark.parametrize(
+    "expiry",
+    [
+        None,
+        "",
+        "not a date",
+        format_datetime(_NOW - timedelta(hours=1), usegmt=True),  # already past
+    ],
+)
+def test_thaw_remaining_none(expiry):
+    assert thaw_remaining(expiry, now=_NOW) is None
+
+
+def test_thaw_remaining_naive_expiry_assumed_utc():
+    # A header that somehow dropped its zone is still read as UTC, not local.
+    assert thaw_remaining("Thu, 02 Jan 2020 00:00:00", now=_NOW) == "1d"

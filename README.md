@@ -53,7 +53,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --profile NAME        profile to use (a saved name, or a raw bucket name); defaults to the configured default profile
+  --profile NAME        profile to use (a saved name, or a raw bucket name). Defaults to the configured default profile
   --allow-deletion      allow deleting objects in the TUI (no effect on the subcommands)
 ```
 

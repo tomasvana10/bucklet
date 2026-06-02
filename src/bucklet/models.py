@@ -55,7 +55,8 @@ class Profile:
     profile; any upload may override it. Credentials may be left blank, in
     which case boto3 falls back to its standard chain (env / ~/.aws / role).
     The ``multipart_*``/``*_concurrency`` knobs are per-profile transfer tuning;
-    each is ``None`` to use the shared default (see :data:`TUNABLES`).
+    each is ``None`` to use the shared default (see :data:`TUNABLES`). ``view``
+    is the TUI's remembered flat/tree choice for this bucket; the CLI ignores it.
     """
 
     name: str
@@ -70,6 +71,7 @@ class Profile:
     multipart_chunksize: int | None = None
     upload_concurrency: int | None = None
     max_concurrency: int | None = None
+    view: str = "flat"
 
     @property
     def credential_source(self) -> str:

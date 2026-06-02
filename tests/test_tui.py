@@ -1277,3 +1277,162 @@ async def test_add_profile_custom_endpoint_keeps_explicit_region(tmp_path):
         await pilot.pause()
         # an explicit region is preserved, not clobbered by the "auto" default
         assert cfg.get("wasabi").region == "us-east-2"
+
+
+# --- add-profile form polish: dropdown spacing, rclone placeholder ----------
+
+
+async def test_add_profile_storage_class_has_gap(tmp_path):
+    from textual.widgets import Select
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("a")
+        await pilot.pause()
+        # the class dropdown carries the same bottom margin as the Input fields,
+        # so it isn't crammed against the credentials section below it
+        assert app.screen.query_one("#class", Select).styles.margin.bottom == 1
+
+
+async def test_add_profile_rclone_placeholder_is_plain(tmp_path):
+    app = _app(tmp_path, FakeService())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.press("a")
+        await pilot.pause()
+        assert app.screen.query_one("#rclone", Input).placeholder == "remote name"
+
+
+def test_switch_profile_binding_is_labelled_switch():
+    binding = next(b for b in BuckletApp.BINDINGS if getattr(b, "action", "") == "switch_profile")
+    assert binding.description == "Switch"
+
+
+# --- thawed objects show how long they stay downloadable --------------------
+
+
+async def test_thawed_object_shows_remaining_window(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from bucklet.tui.app import COL_STATE
+
+    fake = FakeService()
+    expiry = format_datetime(datetime.now(timezone.utc) + timedelta(hours=50), usegmt=True)
+    fake.objects = [ObjectInfo("ready.bin", 10, None, "DEEP_ARCHIVE")]
+    fake._statuses = {
+        "ready.bin": ObjectStatus(
+            "ready.bin", storage.THAWED, "DEEP_ARCHIVE", 10, restore_expiry=expiry
+        )
+    }
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        cell = str(app.query_one(DataTable).get_cell("ready.bin", COL_STATE))
+        assert "ready (2d)" in cell  # 50h floors to 2 whole days
+
+
+# --- advanced thaw still confirms a large object ----------------------------
+
+
+async def test_advanced_thaw_large_object_asks_confirmation(tmp_path):
+    from bucklet.tui.app import THAW_CONFIRM_BYTES
+    from bucklet.tui.screens import AdvancedThawScreen, ConfirmScreen
+
+    fake = FakeService()
+    fake.objects = [ObjectInfo("big.bin", THAW_CONFIRM_BYTES + 1, None, "DEEP_ARCHIVE")]
+    fake._statuses = {"big.bin": ObjectStatus("big.bin", storage.COLD, "DEEP_ARCHIVE", 0)}
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("T")  # advanced thaw dialog on the big cold object
+        await pilot.pause()
+        assert isinstance(app.screen, AdvancedThawScreen)
+        app.screen.query_one("#ok", Button).press()  # accept the default tier/window
+        await pilot.pause()
+        # the large-object confirmation must come after the dialog, before any restore
+        assert isinstance(app.screen, ConfirmScreen)
+        assert fake.restored == []
+        await pilot.press("y")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert ("big.bin", "Bulk", 7) in fake.restored
+
+
+# --- view is remembered per profile -----------------------------------------
+
+
+async def test_profile_opens_in_remembered_view(tmp_path):
+    fake = FakeService()
+    fake.profile.view = "tree"  # what materialize sets from a saved "tree"
+    app = _app(tmp_path, fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.view_mode == "tree"
+        assert app.query_one(Tree).display is True
+        assert app.query_one(DataTable).display is False
+
+
+async def test_view_toggle_persists_to_saved_profile(tmp_path):
+    cfg = _saved_config(tmp_path)  # profile "t" saved, defaults to flat
+    fake = FakeService()  # fake.profile.name == "t", matching the saved profile
+    app = BuckletApp(config=cfg, service=fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.view_mode == "flat"
+        await pilot.press("v")
+        await pilot.pause()
+        assert app.view_mode == "tree"
+        assert app.service.profile.view == "tree"  # live profile updated
+        assert cfg.stored("t")["view"] == "tree"  # and the stored dict
+        assert Config.load(tmp_path).get("t").view == "tree"  # written to disk
+
+
+async def test_view_not_persisted_for_raw_bucket_profile(tmp_path):
+    # a raw-bucket (unsaved) profile has nowhere to store the view; toggling must
+    # apply for the session without raising
+    cfg = Config(tmp_path / "config.json")  # empty: 't' is not saved
+    fake = FakeService()
+    app = BuckletApp(config=cfg, service=fake)
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.press("v")
+        await pilot.pause()
+        assert app.view_mode == "tree"
+        assert not cfg.has("t")  # nothing was written
+
+
+# --- footer scrolls (and grows a row) only when it overflows -----------------
+
+
+async def test_footer_scrolls_when_too_narrow(tmp_path):
+    from bucklet.tui.app import BuckletFooter
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test(size=(40, 24)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.pause()
+        footer = app.query_one(BuckletFooter)
+        assert footer.virtual_size.width > footer.size.width  # content overflows
+        assert footer.show_horizontal_scrollbar is True
+        assert footer.size.height == 2  # grew one row to fit the scrollbar
+
+
+async def test_footer_single_row_when_wide(tmp_path):
+    from bucklet.tui.app import BuckletFooter
+
+    app = _app(tmp_path, FakeService())
+    async with app.run_test(size=(300, 24)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        await pilot.pause()
+        footer = app.query_one(BuckletFooter)
+        assert footer.show_horizontal_scrollbar is False
+        assert footer.size.height == 1  # no scrollbar, no extra row
